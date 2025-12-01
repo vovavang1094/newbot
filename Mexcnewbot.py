@@ -5,177 +5,330 @@ import hashlib
 import logging
 import aiohttp
 import asyncio
+import json
 from dotenv import load_dotenv
 from aiohttp import ClientTimeout
-from telegram import Bot, Update
-from telegram.ext import Application, ContextTypes, CommandHandler
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    ContextTypes,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+)
 from fastapi import FastAPI
 import uvicorn
 import threading
 
 # ====================== НАСТРОЙКИ ======================
 load_dotenv()
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-if not TELEGRAM_TOKEN:
-    raise ValueError("Укажи TELEGRAM_TOKEN в .env")
-
-# Твой личный Telegram ID (узнай через @userinfobot)
-MY_USER_ID = int(os.getenv("MY_USER_ID"))
-
+ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY")
 
-if not MEXC_API_KEY or not MEXC_SECRET_KEY:
-    print("⚠️ MEXC ключи не указаны — будет fallback на 3 монеты")
+# Файл для хранения предыдущих объемов
+VOLUME_HISTORY_FILE = "/tmp/volume_history.json"
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler()]
+)
 logger = logging.getLogger(__name__)
 
+# Глобальные переменные
 ALL_SYMBOLS = set()
-bot = Bot(token=TELEGRAM_TOKEN)
-sent_alerts = set()  # чтобы не спамить
+volume_history = {}  # Для хранения предыдущих объемов
+last_prices = {}  # Для хранения текущих цен
+
+# ====================== СОХРАНЕНИЕ И ЗАГРУЗКА ИСТОРИИ ======================
+def save_history():
+    try:
+        with open(VOLUME_HISTORY_FILE, 'w') as f:
+            json.dump(volume_history, f, indent=2)
+        logger.info("История объемов сохранена")
+    except Exception as e:
+        logger.error(f"Ошибка сохранения истории: {e}")
+
+def load_history():
+    global volume_history
+    try:
+        if os.path.exists(VOLUME_HISTORY_FILE):
+            with open(VOLUME_HISTORY_FILE, 'r') as f:
+                volume_history = json.load(f)
+            logger.info(f"История объемов загружена: {len(volume_history)} пар")
+        else:
+            volume_history = {}
+            logger.info("Файл истории не найден, создаю новый")
+    except Exception as e:
+        logger.error(f"Ошибка загрузки истории: {e}")
+        volume_history = {}
 
 # ====================== MEXC API ======================
 async def load_symbols():
     global ALL_SYMBOLS
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://contract.mexc.com/api/v1/contract/detail", timeout=10) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("success"):
-                        ALL_SYMBOLS = {
-                            s["symbol"].replace("_USDT", "USDT")
-                            for s in data["data"]
-                            if s["symbol"].endswith("_USDT") and s.get("state") == 1
-                        }
-                        logger.info(f"Успешно загружено {len(ALL_SYMBOLS)} фьючерсных пар")
-                        return
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://contract.mexc.com/api/v1/contract/detail", timeout=ClientTimeout(total=10)) as r:
+                if r.status == 200:
+                    j = await r.json()
+                    if j.get("success") and j.get("data"):
+                        # Берем все пары USDT
+                        ALL_SYMBOLS = {x["symbol"].replace("_USDT", "USDT") for x in j["data"] if "_USDT" in x["symbol"]}
+                        logger.info(f"Загружено {len(ALL_SYMBOLS)} пар для мониторинга")
+                        return True
+        # Если API не ответил, используем базовый список
+        ALL_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "MATICUSDT"}
+        logger.info(f"Используем базовый список из {len(ALL_SYMBOLS)} пар")
+        return True
     except Exception as e:
         logger.error(f"Ошибка загрузки символов: {e}")
+        ALL_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "ADAUSDT", "DOGEUSDT", "MATICUSDT"}
+        return False
 
-    # Fallback, если API упал
-    ALL_SYMBOLS = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "1000SHIBUSDT"}
-    logger.warning("Используется fallback-лист (5 монет)")
-
-
-async def get_1m_data(symbol: str):
+async def fetch_volume_and_price(symbol: str) -> tuple:
+    """Получает объем и цену для 1м таймфрейма"""
     sym = symbol.replace("USDT", "_USDT")
     ts = str(int(time.time() * 1000))
-    params = f"symbol={sym}&interval=Min1&limit=2"
-    sign = hmac.new(MEXC_SECRET_KEY.encode(), params.encode(), hashlib.sha256).hexdigest()
+    query = f"symbol={sym}&interval=Min1&limit=1"
+    sign = hmac.new(MEXC_SECRET_KEY.encode(), query.encode(), hashlib.sha256).hexdigest()
     headers = {"ApiKey": MEXC_API_KEY, "Request-Time": ts, "Signature": sign}
-
+    
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
                 f"https://contract.mexc.com/api/v1/contract/kline/{sym}",
-                params={"symbol": sym, "interval": "Min1", "limit": 2},
+                params={"symbol": sym, "interval": "Min1", "limit": 1},
                 headers=headers,
-                timeout=10
-            ) as resp:
-                if resp.status == 200:
-                    j = await resp.json()
-                    if j.get("success") and len(j["data"]["close"]) >= 2:
-                        d = j["data"]
-                        prev_vol = int(float(d["amount"][0]))
-                        curr_vol = int(float(d["amount"][1]))
-                        prev_price = float(d["close"][0])
-                        curr_price = float(d["close"][1])
-                        return prev_vol, curr_vol, prev_price, curr_price
-    except:
-        pass
-    return None, None, None, None
+                timeout=ClientTimeout(total=5)
+            ) as r:
+                if r.status == 200:
+                    j = await r.json()
+                    if j.get("success") and j.get("data"):
+                        # Получаем объем (amount) и цену закрытия (close)
+                        data = j["data"]
+                        volume = int(float(data["amount"][0])) if data.get("amount") else 0
+                        price = float(data["close"][0]) if data.get("close") else 0
+                        return volume, price
+    except Exception as e:
+        logger.error(f"Ошибка получения данных для {symbol}: {e}")
+    return 0, 0
 
-
-# ====================== СКАНЕР ======================
-async def volume_spike_scanner():
-    await asyncio.sleep(15)
-    await load_symbols()
-    logger.info("Сканер всплесков объёма запущен — слежу за всеми монетами")
-
-    while True:
-        try:
-            minute_key = time.strftime("%Y%m%d%H%M")
-
-            for symbol in list(ALL_SYMBOLS):
-                prev_vol, curr_vol, prev_price, curr_price = await get_1m_data(symbol)
-                if not all(x is not None for x in [prev_vol, curr_vol, prev_price, curr_price]):
-                    continue
-
-                if prev_vol < 1000 and curr_vol > 2000:
-                    alert_id = f"{symbol}_{minute_key}"
-                    if alert_id in sent_alerts:
+# ====================== ОСНОВНОЙ МОНИТОРИНГ ======================
+async def monitor_all_symbols(application: Application):
+    await asyncio.sleep(5)
+    loaded = await load_symbols()
+    if not loaded:
+        logger.warning("Не удалось загрузить символы, используем базовый список")
+    
+    logger.info(f"Мониторинг запущен для {len(ALL_SYMBOLS)} пар")
+    
+    try:
+        while True:
+            try:
+                alerts_sent = 0
+                for symbol in list(ALL_SYMBOLS):
+                    try:
+                        # Получаем текущий объем и цену
+                        current_volume, current_price = await fetch_volume_and_price(symbol)
+                        
+                        if current_volume == 0:
+                            continue
+                        
+                        # Сохраняем текущую цену
+                        last_prices[symbol] = current_price
+                        
+                        # Получаем предыдущий объем
+                        prev_volume = volume_history.get(symbol, {}).get('volume', 0)
+                        prev_time = volume_history.get(symbol, {}).get('timestamp', 0)
+                        
+                        # Проверяем условие: предыдущий объем < 1000, текущий объем > 2000
+                        if (prev_volume < 1000 and 
+                            current_volume > 2000 and 
+                            (time.time() - prev_time) > 30):  # Защита от повторных алертов
+                            
+                            # Рассчитываем процент изменения
+                            if prev_volume > 0:
+                                change_percent = ((current_volume - prev_volume) / prev_volume) * 100
+                            else:
+                                change_percent = 99999  # Очень большой процент роста
+                            
+                            # Формируем сообщение
+                            symbol_name = symbol.replace("USDT", "")
+                            url = f"https://www.mexc.com/ru-RU/futures/{symbol_name}_USDT"
+                            
+                            message = (
+                                f"🚨 <b>ВСПЛЕСК ОБЪЁМА {symbol_name}</b> 🚨\n\n"
+                                f"📈 <b>Изменение:</b> {change_percent:+.1f}%\n"
+                                f"📊 <b>Пред. объем:</b> {prev_volume:,} USDT\n"
+                                f"📊 <b>Тек. объем:</b> {current_volume:,} USDT\n"
+                                f"💰 <b>Цена:</b> ${current_price:.4f}\n"
+                                f"🔗 <a href='{url}'>MEXC Futures: {symbol_name}/USDT</a>"
+                            )
+                            
+                            # Отправляем уведомление всем авторизованным пользователям
+                            await application.bot.send_message(
+                                ALLOWED_USER_ID,
+                                message,
+                                parse_mode="HTML",
+                                disable_web_page_preview=True
+                            )
+                            
+                            alerts_sent += 1
+                            logger.info(f"Алерт отправлен для {symbol}: {prev_volume} -> {current_volume} USDT")
+                        
+                        # Обновляем историю
+                        volume_history[symbol] = {
+                            'volume': current_volume,
+                            'timestamp': time.time()
+                        }
+                        
+                        # Небольшая задержка между запросами, чтобы не перегружать API
+                        await asyncio.sleep(0.1)
+                        
+                    except Exception as e:
+                        logger.error(f"Ошибка мониторинга {symbol}: {e}")
                         continue
+                
+                # Сохраняем историю каждую итерацию
+                if alerts_sent > 0 or time.time() % 300 < 30:  # Сохраняем каждые 5 минут или если были алерты
+                    save_history()
+                
+                logger.info(f"Цикл мониторинга завершен. Отправлено алертов: {alerts_sent}")
+                await asyncio.sleep(30)  # Пауза между циклами мониторинга
+                
+            except asyncio.CancelledError:
+                logger.info("Мониторинг остановлен")
+                break
+            except Exception as e:
+                logger.error(f"Ошибка в цикле мониторинга: {e}")
+                await asyncio.sleep(60)
+                
+    except Exception as e:
+        logger.error(f"Критическая ошибка мониторинга: {e}")
+    finally:
+        # Сохраняем историю перед завершением
+        save_history()
 
-                    change_pct = (curr_price - prev_price) / prev_price * 100
-                    emoji = "UP" if change_pct >= 0 else "DOWN"
-
-                    message = (
-                        f"<b>ВСПЛЕСК ОБЪЁМА НА {symbol}!</b>\n\n"
-                        f"Предыдущий объём: <b>{prev_vol:,}</b> USDT\n"
-                        f"Текущий объём: <b>{curr_vol:,}</b> USDT (+{curr_vol-prev_vol:,})\n"
-                        f"Цена: {prev_price:.6f} → <b>{curr_price:.6f}</b> USDT\n"
-                        f"Изменение: {emoji} <b>{change_pct:+.2f}%</b>\n\n"
-                        f"<a href='https://www.mexc.com/futures/{symbol[:-4]}_USDT'>Открыть на MEXC</a>"
-                    )
-
-                    await bot.send_message(
-                        chat_id=MY_USER_ID,
-                        text=message,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True
-                    )
-                    sent_alerts.add(alert_id)
-                    logger.info(f"АЛЕРТ → {symbol} | {curr_vol:,} USDT")
-
-            # Чистим старые алерты (старше 10 минут)
-            sent_alerts = {a for a in sent_alerts if a.endswith(minute_key[-4:]) or int(time.time()) - int(a.split("_")[-1]) < 600}
-
-            await asyncio.sleep(58)
-
-        except Exception as e:
-            logger.error(f"Ошибка в сканере: {e}")
-            await asyncio.sleep(60)
-
-
-# ====================== /start ======================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != MY_USER_ID:
-        await update.message.reply_text("Доступ запрещён")
+# ====================== ОБРАБОТЧИК КОМАНД ======================
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ALLOWED_USER_ID:
+        await update.message.reply_text("🚫 Доступ запрещён")
         return
+    
     await update.message.reply_text(
-        "<b>Сканер всплесков объёма запущен!</b>\n\n"
-        "Я пришлю уведомление, как только у любой монеты на фьючерсах MEXC:\n"
-        "• был объём < 1 000 USDT\n"
-        "• стал > 2 000 USDT за 1 минуту\n\n"
-        "Работаю 24/7",
+        "🤖 <b>MEXC Volume Spike Bot</b>\n\n"
+        "📊 <b>Мониторинг:</b> Все пары на 1m таймфрейме\n"
+        "🔔 <b>Условие:</b> Пред. объем < 1,000 USDT → Тек. объем > 2,000 USDT\n"
+        "⚡ <b>Частота:</b> Проверка каждые 30 секунд\n"
+        f"👁️ <b>Отслеживается:</b> {len(ALL_SYMBOLS)} пар\n\n"
+        "Бот автоматически отправляет уведомления при обнаружении всплесков объема.",
         parse_mode="HTML"
     )
 
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ALLOWED_USER_ID:
+        await update.message.reply_text("🚫 Доступ запрещён")
+        return
+    
+    # Показываем статистику
+    monitored_count = len(ALL_SYMBOLS)
+    history_count = len(volume_history)
+    
+    status_text = (
+        f"📊 <b>Статус мониторинга</b>\n\n"
+        f"✅ <b>Мониторится пар:</b> {monitored_count}\n"
+        f"📈 <b>В истории:</b> {history_count} пар\n"
+        f"⏰ <b>Последнее обновление:</b> {time.strftime('%H:%M:%S')}\n\n"
+    )
+    
+    # Добавляем топ-5 пар по текущему объему
+    if volume_history:
+        status_text += "<b>Текущие объемы (топ-5):</b>\n"
+        
+        # Сортируем по объему
+        sorted_items = sorted(volume_history.items(), 
+                             key=lambda x: x[1].get('volume', 0), 
+                             reverse=True)
+        
+        for i, (symbol, data) in enumerate(sorted_items[:5]):
+            volume = data.get('volume', 0)
+            price = last_prices.get(symbol, 0)
+            status_text += f"{i+1}. {symbol}: {volume:,} USDT (${price:.4f})\n"
+    else:
+        status_text += "📭 Нет данных об объемах\n"
+    
+    await update.message.reply_text(status_text, parse_mode="HTML")
 
-# ====================== ВЕБ ДЛЯ RENDER ======================
-app = FastAPI()
-@app.get("/")
+# ====================== POST_INIT ======================
+async def post_init(application: Application):
+    load_history()  # Загружаем историю объемов
+    await load_symbols()  # Загружаем символы
+    # Запускаем мониторинг
+    asyncio.create_task(monitor_all_symbols(application))
+    logger.info("Бот инициализирован и готов к работе")
+
+# ====================== ВЕБ-СЕРВЕР ДЛЯ RENDER ======================
+web_app = FastAPI()
+
+@web_app.get("/")
 async def root():
-    return {"status": "ok", "scanner": "running", "symbols": len(ALL_SYMBOLS)}
+    return {
+        "status": "MEXC Volume Spike Bot работает",
+        "monitored_pairs": len(ALL_SYMBOLS),
+        "in_history": len(volume_history),
+        "time": time.strftime("%H:%M:%S")
+    }
 
-def run_web():
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), log_level="error")
+@web_app.get("/health")
+async def health():
+    return {"status": "healthy", "timestamp": time.time()}
 
+def run_web_server():
+    uvicorn.run(web_app, host="0.0.0.0", port=int(os.environ.get("PORT", 8000)), log_level="error")
 
-# ====================== ЗАПУСК ======================
+# ====================== ЗАПУСК БОТА ======================
+def run_bot():
+    # Создаем application
+    application = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(post_init)
+        .concurrent_updates(True)
+        .build()
+    )
+
+    # Добавляем обработчики команд
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'^/start$'), start_command))
+    application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'^/status$'), status_command))
+
+    logger.info("MEXC Volume Spike Bot запускается...")
+    
+    try:
+        # Используем стандартный run_polling
+        application.run_polling(
+            drop_pending_updates=True,
+            timeout=30,
+            allowed_updates=Update.ALL_TYPES
+        )
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен пользователем")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}", exc_info=True)
+    finally:
+        # Сохраняем историю при завершении
+        save_history()
+        logger.info("История сохранена")
+
+# ====================== ГЛАВНАЯ ФУНКЦИЯ ======================
 if __name__ == "__main__":
-    threading.Thread(target=run_web, daemon=True).start()
-
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-
-    # Запускаем сканер в фоне
-    async def main():
-        await load_symbols()
-        application.create_task(volume_spike_scanner())
-        await application.run_polling()
-
-    asyncio.run(main())
+    # Запускаем веб-сервер в отдельном потоке
+    web_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_thread.start()
+    
+    # Даем веб-серверу время запуститься
+    time.sleep(2)
+    
+    # Запускаем бота
+    run_bot()
