@@ -346,6 +346,7 @@ async def load_and_filter_symbols():
         
         if tracked_symbols:
             sample = list(tracked_symbols)[:15]
+            logger.info(f"   Примеры: {', '.join(sample)}")
             
             # Отправляем уведомление без HTML
             try:
@@ -498,7 +499,7 @@ async def volume_spike_scanner():
             iteration += 1
             
             if iteration % 10 == 1:
-                logger.info(f"Итерация {iteration}. Пар: {len(tracked_symbols)}")
+                logger.info(f"Итерация {iteration}. Пар: {len(tracked_symbols)}. Алертов за сессию: {len(sent_alerts)}")
             
             # Обновляем список символов каждые 6 часов
             if iteration % 720 == 0:
@@ -508,10 +509,12 @@ async def volume_spike_scanner():
             
             symbols_list = list(tracked_symbols)
             if not symbols_list:
+                logger.warning("Нет символов для сканирования")
                 await asyncio.sleep(60)
                 continue
             
-            max_per_iteration = min(80, len(symbols_list))
+            # Увеличиваем количество символов для сканирования
+            max_per_iteration = min(200, len(symbols_list))
             random.shuffle(symbols_list)
             
             for symbol in symbols_list[:max_per_iteration]:
@@ -544,6 +547,9 @@ async def volume_spike_scanner():
                         
                         if volume_change_pct < 50:
                             continue
+                        
+                        # Логируем для отладки
+                        logger.info(f"🚨 АЛЕРТ: {symbol} | {prev_vol:,}→{curr_vol:,} (+{volume_change_pct:.0f}%)")
                         
                         # Сохраняем алерт в историю
                         await save_alert_to_history(
@@ -579,7 +585,7 @@ async def volume_spike_scanner():
                             )
                             
                             sent_alerts[alert_id] = time.time()
-                            logger.info(f"🚨 {symbol} | {prev_vol:,}→{curr_vol:,} (+{volume_change_pct:.0f}%)")
+                            logger.info(f"🚨 АЛЕРТ ОТПРАВЛЕН: {symbol} | {prev_vol:,}→{curr_vol:,} (+{volume_change_pct:.0f}%)")
                             
                         except Exception as e:
                             logger.error(f"Ошибка отправки: {e}")
@@ -594,14 +600,14 @@ async def volume_spike_scanner():
             for exp in expired:
                 sent_alerts.pop(exp, None)
             
-            await asyncio.sleep(35)
+            await asyncio.sleep(20)  # Уменьшили паузу для более частого сканирования
             
         except asyncio.CancelledError:
             logger.info("Сканер остановлен")
             break
         except Exception as e:
             logger.error(f"Ошибка в сканере: {e}")
-            await asyncio.sleep(60)
+            await asyncio.sleep(30)
 
 
 # ====================== TELEGRAM КОМАНДЫ И КНОПКИ ======================
@@ -867,6 +873,148 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Ошибка получения статистики")
 
 
+# ====================== ОТЛАДОЧНЫЕ КОМАНДЫ ======================
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для отладки"""
+    if update.effective_user.id != MY_USER_ID:
+        return
+    
+    # Получаем статистику по текущим символам
+    sample_symbols = list(tracked_symbols)[:5]
+    
+    debug_info = (
+        f"🔧 Отладка\n\n"
+        f"Всего пар: {len(tracked_symbols)}\n"
+        f"В блэк-листе: {len(blacklist)}\n"
+        f"Паузы: {len(paused_alerts)}\n"
+        f"Алертов за сессию: {len(sent_alerts)}\n\n"
+        f"Примеры пар:\n"
+    )
+    
+    # Проверяем несколько символов
+    for symbol in sample_symbols:
+        try:
+            data = await get_1m_kline_data(symbol)
+            if data:
+                debug_info += f"• {symbol}: {data['prev_volume']:,} → {data['curr_volume']:,} USDT\n"
+            else:
+                debug_info += f"• {symbol}: нет данных\n"
+        except:
+            debug_info += f"• {symbol}: ошибка\n"
+    
+    debug_info += f"\nФильтры:\n"
+    debug_info += f"MIN_PREV_VOLUME: {MIN_PREV_VOLUME}\n"
+    debug_info += f"MIN_CURRENT_VOLUME: {MIN_CURRENT_VOLUME}\n"
+    debug_info += f"DAILY_VOLUME_LIMIT: {DAILY_VOLUME_LIMIT:,}\n"
+    
+    await update.message.reply_text(debug_info)
+
+
+async def test_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Протестировать конкретный символ"""
+    if update.effective_user.id != MY_USER_ID:
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Укажите символ: /test BTCUSDT")
+        return
+    
+    symbol = context.args[0].upper()
+    if not symbol.endswith("USDT"):
+        symbol = f"{symbol}USDT"
+    
+    await update.message.reply_text(f"Тестирую {symbol}...")
+    
+    try:
+        # Проверяем 1D объем
+        daily_volume = await get_1d_volume(symbol)
+        
+        # Проверяем 1m данные
+        data = await get_1m_kline_data(symbol)
+        
+        message = f"📊 {symbol}\n\n"
+        
+        if data:
+            message += (
+                f"1m данные:\n"
+                f"• Пред. объем: {data['prev_volume']:,}\n"
+                f"• Тек. объем: {data['curr_volume']:,}\n"
+                f"• Пред. цена: {data['prev_price']:.8f}\n"
+                f"• Тек. цена: {data['curr_price']:.8f}\n\n"
+            )
+            
+            # Проверяем условия
+            conditions = []
+            
+            if data['prev_volume'] < MIN_PREV_VOLUME:
+                conditions.append(f"✓ Пред. объем < {MIN_PREV_VOLUME}")
+            else:
+                conditions.append(f"✗ Пред. объем > {MIN_PREV_VOLUME}")
+                
+            if data['curr_volume'] > MIN_CURRENT_VOLUME:
+                conditions.append(f"✓ Тек. объем > {MIN_CURRENT_VOLUME}")
+            else:
+                conditions.append(f"✗ Тек. объем < {MIN_CURRENT_VOLUME}")
+                
+            volume_change_pct = ((data['curr_volume'] - data['prev_volume']) / max(data['prev_volume'], 1)) * 100
+            conditions.append(f"Изменение: {volume_change_pct:.0f}%")
+            
+            message += "Условия:\n" + "\n".join(f"• {c}" for c in conditions)
+        else:
+            message += "❌ Нет 1m данных\n"
+        
+        message += f"\n1D объем: {daily_volume:,.0f} USDT"
+        
+        if daily_volume > DAILY_VOLUME_LIMIT:
+            message += f" ( > {DAILY_VOLUME_LIMIT:,} - ПРОПУСК)"
+        else:
+            message += f" ( < {DAILY_VOLUME_LIMIT:,} - ОК)"
+        
+        await update.message.reply_text(message)
+        
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка: {str(e)}")
+
+
+async def force_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительная проверка всех символов"""
+    if update.effective_user.id != MY_USER_ID:
+        return
+    
+    await update.message.reply_text("Начинаю принудительную проверку всех символов...")
+    
+    if not tracked_symbols:
+        await update.message.reply_text("Нет символов для проверки")
+        return
+    
+    symbols_to_check = list(tracked_symbols)[:50]  # Проверяем первые 50
+    alerts_found = 0
+    
+    for symbol in symbols_to_check:
+        try:
+            data = await get_1m_kline_data(symbol)
+            if data:
+                prev_vol = data["prev_volume"]
+                curr_vol = data["curr_volume"]
+                
+                if prev_vol < MIN_PREV_VOLUME and curr_vol > MIN_CURRENT_VOLUME:
+                    volume_change_pct = ((curr_vol - prev_vol) / max(prev_vol, 1)) * 100
+                    
+                    if volume_change_pct >= 50:
+                        alerts_found += 1
+                        
+                        await update.message.reply_text(
+                            f"⚡ {symbol}\n"
+                            f"Объём: {prev_vol:,} → {curr_vol:,}\n"
+                            f"Изменение: +{volume_change_pct:.0f}%"
+                        )
+                        
+        except Exception as e:
+            continue
+    
+    await update.message.reply_text(f"Проверка завершена. Найдено алертов: {alerts_found}")
+
+
 async def run_telegram_polling():
     """Запуск Telegram polling"""
     try:
@@ -912,6 +1060,9 @@ async def lifespan(app: FastAPI):
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("debug", debug))
+    application.add_handler(CommandHandler("test", test_symbol))
+    application.add_handler(CommandHandler("check", force_check))
     application.add_handler(CallbackQueryHandler(button_handler))
     
     # Загружаем и фильтруем символы
