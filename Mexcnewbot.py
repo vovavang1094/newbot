@@ -353,7 +353,6 @@ async def load_and_filter_symbols():
                              f"• 1D объём < {DAILY_VOLUME_LIMIT:,} USDT\n"
                              f"• Пред. 5 мин < {MIN_PREV_VOLUME} USDT\n"
                              f"• Тек. 5 мин > {MIN_CURRENT_VOLUME} USDT\n"
-                             f"• Минимальный рост: 300%\n"
                              f"• Цена: {MIN_PRICE:.4f} - {MAX_PRICE:.2f} USDT\n"
                              f"• Исключены акции\n\n"
                              f"Примеры:\n{', '.join(sample[:8])}"
@@ -547,11 +546,6 @@ async def volume_spike_scanner():
                         else:
                             price_change_pct = 0
                         
-                        # Дополнительное условие: рост минимум на 300%
-                        if volume_change_pct < 300:
-                            logger.debug(f"Пропускаем {symbol}: рост {volume_change_pct:.0f}% < 300%")
-                            continue
-                        
                         # ВСЕ УСЛОВИЯ ВЫПОЛНЕНЫ - ОТПРАВЛЯЕМ АЛЕРТ
                         logger.info(f"🚨 АЛЕРТ НАЙДЕН: {symbol}")
                         logger.info(f"   Пред. 5 мин: {prev_vol:,} USDT ( < {MIN_PREV_VOLUME})")
@@ -585,15 +579,12 @@ async def volume_spike_scanner():
                         )
                         
                         try:
-                            # ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ ПЕРЕД ОТПРАВКОЙ
+                            # Логируем попытку отправки
                             logger.info(f"📤 Пытаюсь отправить алерт {symbol}")
                             logger.info(f"   Chat ID: {MY_USER_ID}")
-                            logger.info(f"   Token length: {len(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else 0}")
-                            logger.info(f"   Сообщение: {message[:100]}...")
                             
                             # Основной способ: Создаем нового бота для отправки
                             temp_bot = Bot(token=TELEGRAM_TOKEN)
-                            logger.info(f"   Бот создан, отправляю сообщение...")
                             
                             # Отправляем сообщение
                             result = await temp_bot.send_message(
@@ -607,23 +598,11 @@ async def volume_spike_scanner():
                             logger.info(f"   Message ID: {result.message_id}")
                             sent_alerts[alert_id] = time.time()
                             
-                            # Также пытаемся отправить через bot_instance
-                            if bot_instance:
-                                try:
-                                    await bot_instance.send_message(
-                                        chat_id=MY_USER_ID,
-                                        text=f"📈 {symbol}: +{volume_change_pct:.0f}% за 5 мин",
-                                        disable_web_page_preview=True
-                                    )
-                                except Exception as dup_error:
-                                    logger.warning(f"Дублирование не удалось: {dup_error}")
-                            
                         except Exception as e:
                             logger.error(f"❌ ОШИБКА ОТПРАВКИ АЛЕРТА {symbol}:")
                             logger.error(f"   Тип ошибки: {type(e).__name__}")
                             logger.error(f"   Сообщение: {str(e)}")
                             logger.error(f"   Chat ID: {MY_USER_ID}")
-                            logger.error(f"   Token: {'Установлен' if TELEGRAM_TOKEN else 'Нет'}")
                             
                             # Пробуем упрощенное сообщение без кнопок
                             try:
@@ -641,7 +620,7 @@ async def volume_spike_scanner():
                                 logger.error(f"❌ Ошибка упрощенной отправки: {e2}")
                             
                 except Exception as e:
-                    logger.debug(f"Ошибка обработки {symbol}: {str(e)[:100]}")
+                    logger.error(f"Ошибка обработки {symbol}: {str(e)}")
                     continue
             
             # Очищаем старые алерты
@@ -703,7 +682,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• 1D объём < {DAILY_VOLUME_LIMIT:,} USDT\n"
         f"• Пред. 5 мин < {MIN_PREV_VOLUME} USDT\n"
         f"• Тек. 5 мин > {MIN_CURRENT_VOLUME} USDT\n"
-        f"• Минимальный рост: 300%\n"
         f"• Цена: {MIN_PRICE:.4f} - {MAX_PRICE:.2f} USDT\n\n"
         f"Выберите действие:"
     )
@@ -780,7 +758,6 @@ async def start_callback(query):
         f"• 1D объём < {DAILY_VOLUME_LIMIT:,} USDT\n"
         f"• Пред. 5 мин < {MIN_PREV_VOLUME} USDT\n"
         f"• Тек. 5 мин > {MIN_CURRENT_VOLUME} USDT\n"
-        f"• Минимальный рост: 300%\n"
         f"• Цена: {MIN_PRICE:.4f} - {MAX_PRICE:.2f} USDT\n\n"
         f"Выберите действие:"
     )
@@ -1046,12 +1023,6 @@ async def test_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
             volume_change_pct = ((data['curr_volume'] - data['prev_volume']) / max(data['prev_volume'], 1)) * 100
             conditions.append(f"Изменение: {volume_change_pct:.0f}%")
             
-            # Проверяем дополнительное условие
-            if volume_change_pct >= 300:
-                conditions.append(f"✓ Рост >= 300%")
-            else:
-                conditions.append(f"✗ Рост < 300%")
-            
             message += "Условия для алерта:\n" + "\n".join(f"• {c}" for c in conditions)
         else:
             message += "❌ Нет 5m данных\n"
@@ -1194,7 +1165,6 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     debug_info += f"MIN_PREV_VOLUME (пред. 5 мин): {MIN_PREV_VOLUME}\n"
     debug_info += f"MIN_CURRENT_VOLUME (тек. 5 мин): {MIN_CURRENT_VOLUME}\n"
     debug_info += f"DAILY_VOLUME_LIMIT: {DAILY_VOLUME_LIMIT:,}\n"
-    debug_info += f"Минимальный рост: 300%\n"
     debug_info += f"MY_USER_ID: {MY_USER_ID}\n"
     
     # Отправляем сообщение
@@ -1250,19 +1220,19 @@ async def test_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Тесты отправки завершены. Проверьте логи.")
 
 
-async def send_last_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Принудительно отправить последний найденный алерт"""
+async def force_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительно отправить алерт для символа прямо сейчас"""
     if update.effective_user.id != MY_USER_ID:
         return
     
     if not context.args:
-        await update.message.reply_text("Укажите символ: /sendalert ORBSUSDT")
+        await update.message.reply_text("Укажите символ: /forcealert CHFUSDT")
         return
     
     symbol = context.args[0].upper()
     
     try:
-        # Получаем свежие данные
+        # Получаем данные
         data = await get_5m_kline_data(symbol)
         if not data:
             await update.message.reply_text(f"❌ Нет данных для {symbol}")
@@ -1279,29 +1249,46 @@ async def send_last_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             price_change_pct = 0
         
-        # Создаем сообщение
+        # Создаем алерт как в сканере
+        alert_id = f"{symbol}_force_{datetime.now().strftime('%Y%m%d%H%M')}"
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("🔕 Выключить увед.", callback_data=f"pause_{symbol}"),
+                InlineKeyboardButton("🚫 В блэк-лист", callback_data=f"blacklist_{symbol}")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
         message = (
             f"⚡ ПРИНУДИТЕЛЬНЫЙ АЛЕРТ: {symbol}\n"
             f"Объём за 5 мин: {prev_vol:,} → {curr_vol:,} USDT\n"
             f"Изменение: {volume_change_pct:+.0f}%\n"
             f"Цена: {price_change_pct:+.2f}%\n"
-            f"Пред. 5 мин < 1000: {'✅ ДА' if prev_vol < 1000 else '❌ НЕТ'}\n"
-            f"Тек. 5 мин > 4000: {'✅ ДА' if curr_vol > 4000 else '❌ НЕТ'}\n"
-            f"Рост >= 300%: {'✅ ДА' if volume_change_pct >= 300 else '❌ НЕТ'}"
+            f"https://www.mexc.com/futures/{symbol[:-4]}_USDT"
         )
         
         # Отправляем
         temp_bot = Bot(token=TELEGRAM_TOKEN)
-        await temp_bot.send_message(
+        result = await temp_bot.send_message(
             chat_id=MY_USER_ID,
             text=message,
-            disable_web_page_preview=True
+            disable_web_page_preview=True,
+            reply_markup=reply_markup
         )
         
-        await update.message.reply_text(f"✅ Принудительный алерт отправлен для {symbol}")
+        await update.message.reply_text(f"✅ Принудительный алерт отправлен для {symbol}\nMessage ID: {result.message_id}")
+        
+        # Сохраняем в историю
+        await save_alert_to_history(
+            symbol, prev_vol, curr_vol, 
+            prev_price, curr_price,
+            volume_change_pct, price_change_pct
+        )
         
     except Exception as e:
         await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+        logger.error(f"Ошибка в force_alert: {e}")
 
 
 async def run_telegram_polling():
@@ -1354,7 +1341,7 @@ async def lifespan(app: FastAPI):
     application.add_handler(CommandHandler("env", env_check))
     application.add_handler(CommandHandler("testalert", send_test_alert))
     application.add_handler(CommandHandler("testbot", test_bot))
-    application.add_handler(CommandHandler("sendalert", send_last_alert))
+    application.add_handler(CommandHandler("forcealert", force_alert))
     application.add_handler(CallbackQueryHandler(button_handler))
     
     # Загружаем и фильтруем символы
