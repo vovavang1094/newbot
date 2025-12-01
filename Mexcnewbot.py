@@ -25,8 +25,8 @@ MEXC_API_KEY = os.getenv("MEXC_API_KEY", "")
 MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "")
 
 DAILY_VOLUME_LIMIT = 500_000
-MIN_PREV_VOLUME = 1000
-MIN_CURRENT_VOLUME = 2200
+MIN_PREV_VOLUME = 1000      # Объем за предыдущие 5 минут
+MIN_CURRENT_VOLUME = 4000   # Объем за текущие 5 минут
 MIN_PRICE = 0.0001
 MAX_PRICE = 100
 
@@ -143,12 +143,12 @@ async def get_1d_volume(symbol: str) -> float:
         return 0
 
 
-async def get_1m_kline_data(symbol: str):
-    """Получаем данные за последние 2 свечи на 1-минутном таймфрейме"""
+async def get_5m_kline_data(symbol: str):
+    """Получаем данные за последние 10 свечей на 5-минутном таймфрейме (50 минут)"""
     api_symbol = symbol.replace("USDT", "_USDT")
     timestamp = str(int(time.time() * 1000))
     
-    query_string = f"symbol={api_symbol}&interval=Min1&limit=2"
+    query_string = f"symbol={api_symbol}&interval=Min5&limit=10"
     signature = generate_signature(query_string)
     
     headers = {
@@ -163,8 +163,8 @@ async def get_1m_kline_data(symbol: str):
                 f"https://contract.mexc.com/api/v1/contract/kline/{api_symbol}",
                 params={
                     "symbol": api_symbol,
-                    "interval": "Min1",
-                    "limit": 2
+                    "interval": "Min5",
+                    "limit": 10
                 },
                 headers=headers,
                 timeout=10
@@ -176,10 +176,13 @@ async def get_1m_kline_data(symbol: str):
                         kline_data = data["data"]
                         
                         if len(kline_data.get("close", [])) >= 2:
-                            prev_volume = int(float(kline_data["amount"][0]))
-                            prev_close = float(kline_data["close"][0])
-                            curr_volume = int(float(kline_data["amount"][1]))
-                            curr_close = float(kline_data["close"][1])
+                            # Суммируем объем за последние 5 минут (текущая свеча)
+                            curr_volume = int(float(kline_data["amount"][-1]))
+                            curr_close = float(kline_data["close"][-1])
+                            
+                            # Суммируем объем за предыдущие 5 минут (предыдущая свеча)
+                            prev_volume = int(float(kline_data["amount"][-2]))
+                            prev_close = float(kline_data["close"][-2])
                             
                             return {
                                 "prev_volume": prev_volume,
@@ -190,7 +193,7 @@ async def get_1m_kline_data(symbol: str):
                             }
                 
     except Exception as e:
-        logger.debug(f"Ошибка 1m данных для {symbol}: {str(e)[:100]}")
+        logger.debug(f"Ошибка 5m данных для {symbol}: {str(e)[:100]}")
     
     return None
 
@@ -255,7 +258,7 @@ async def check_symbol_conditions(symbol: str) -> bool:
         
         # 6. Проверяем цену токена
         try:
-            data = await get_1m_kline_data(symbol)
+            data = await get_5m_kline_data(symbol)
             if data:
                 current_price = data["curr_price"]
                 
@@ -291,7 +294,7 @@ async def load_and_filter_symbols():
             logger.error("Не удалось получить символы фьючерсов")
             return False
         
-        logger.info(f"Получено {len(all_symbols)} символов. Начинаю фильтрацию...")
+        logger.info(f"Получено {len(all_symbols)} символов. Начинаю фильтрация...")
         
         # 1. Фильтруем акции
         filtered_symbols = filter_stock_symbols(all_symbols)
@@ -348,6 +351,8 @@ async def load_and_filter_symbols():
                              f"Уведомления отключены: {len(paused_alerts)} монет\n\n"
                              f"Фильтры:\n"
                              f"• 1D объём < {DAILY_VOLUME_LIMIT:,} USDT\n"
+                             f"• Пред. 5 мин < {MIN_PREV_VOLUME} USDT\n"
+                             f"• Тек. 5 мин > {MIN_CURRENT_VOLUME} USDT\n"
                              f"• Цена: {MIN_PRICE:.4f} - {MAX_PRICE:.2f} USDT\n"
                              f"• Исключены акции\n\n"
                              f"Примеры:\n{', '.join(sample[:8])}"
@@ -475,11 +480,12 @@ async def remove_from_blacklist(query, symbol: str):
         )
 
 
-# ====================== СКАНЕР ======================
+# ====================== СКАНЕР (5-минутные интервалы) ======================
 async def volume_spike_scanner():
-    """Сканируем все низковольюмные пары на всплески объёма на 1m"""
+    """Сканируем все низковольюмные пары на всплески объёма на 5m"""
     logger.info(f"🚀 Сканер запущен! Отслеживаю {len(tracked_symbols)} пар")
     logger.info(f"Ваш USER_ID: {MY_USER_ID}")
+    logger.info(f"Условия: Пред. 5 мин < {MIN_PREV_VOLUME}, Тек. 5 мин > {MIN_CURRENT_VOLUME}")
     
     if len(tracked_symbols) == 0:
         logger.warning("Нет пар для отслеживания!")
@@ -489,14 +495,14 @@ async def volume_spike_scanner():
     
     while True:
         try:
-            current_minute = datetime.now().strftime("%Y%m%d%H%M")
+            current_5min = datetime.now().strftime("%Y%m%d%H%M")[:11] + str(int(datetime.now().minute / 5) * 5).zfill(2)
             iteration += 1
             
-            if iteration % 10 == 1:
+            if iteration % 5 == 1:
                 logger.info(f"Итерация {iteration}. Пар: {len(tracked_symbols)}. Алертов за сессию: {len(sent_alerts)}")
             
             # Обновляем список символов каждые 6 часов
-            if iteration % 720 == 0:
+            if iteration % 432 == 0:  # Каждые 6 часов (при проверке каждые 50 секунд)
                 logger.info("🔄 Обновляю список символов (каждые 6 часов)...")
                 await load_and_filter_symbols()
                 continue
@@ -517,7 +523,7 @@ async def volume_spike_scanner():
                     if symbol in paused_alerts:
                         continue
                     
-                    data = await get_1m_kline_data(symbol)
+                    data = await get_5m_kline_data(symbol)
                     if not data:
                         continue
                     
@@ -526,9 +532,9 @@ async def volume_spike_scanner():
                     prev_price = data["prev_price"]
                     curr_price = data["curr_price"]
                     
-                    # Проверяем условие всплеска
+                    # Проверяем условие всплеска за 5 минут
                     if prev_vol < MIN_PREV_VOLUME and curr_vol > MIN_CURRENT_VOLUME:
-                        alert_id = f"{symbol}_{current_minute}"
+                        alert_id = f"{symbol}_{current_5min}"
                         
                         if alert_id in sent_alerts:
                             continue
@@ -539,11 +545,16 @@ async def volume_spike_scanner():
                         else:
                             price_change_pct = 0
                         
-                        if volume_change_pct < 50:
+                        # Дополнительное условие: рост минимум на 300%
+                        if volume_change_pct < 300:
                             continue
                         
-                        # Логируем для отладки
-                        logger.info(f"🚨 АЛЕРТ НАЙДЕН: {symbol} | {prev_vol:,}→{curr_vol:,} (+{volume_change_pct:.0f}%)")
+                        # ВСЕ УСЛОВИЯ ВЫПОЛНЕНЫ - ОТПРАВЛЯЕМ АЛЕРТ
+                        logger.info(f"🚨 АЛЕРТ НАЙДЕН: {symbol}")
+                        logger.info(f"   Пред. 5 мин: {prev_vol:,} USDT ( < {MIN_PREV_VOLUME})")
+                        logger.info(f"   Тек. 5 мин: {curr_vol:,} USDT ( > {MIN_CURRENT_VOLUME})")
+                        logger.info(f"   Изменение: +{volume_change_pct:.0f}%")
+                        logger.info(f"   Изменение цены: {price_change_pct:+.2f}%")
                         
                         # Сохраняем алерт в историю
                         await save_alert_to_history(
@@ -563,8 +574,8 @@ async def volume_spike_scanner():
                         
                         # Сообщение без HTML тегов
                         message = (
-                            f"⚡ {symbol}\n"
-                            f"Объём: {prev_vol:,} → {curr_vol:,} USDT\n"
+                            f"⚡ 5-МИНУТНЫЙ АЛЕРТ: {symbol}\n"
+                            f"Объём за 5 мин: {prev_vol:,} → {curr_vol:,} USDT\n"
                             f"Изменение: {volume_change_pct:+.0f}%\n"
                             f"Цена: {price_change_pct:+.2f}%\n"
                             f"https://www.mexc.com/futures/{symbol[:-4]}_USDT"
@@ -572,12 +583,12 @@ async def volume_spike_scanner():
                         
                         try:
                             # Логируем попытку отправки
-                            logger.info(f"Попытка отправить алерт {symbol} на chat_id: {MY_USER_ID}")
+                            logger.info(f"📤 Отправляю алерт {symbol} на chat_id: {MY_USER_ID}")
                             
-                            # ОСНОВНОЙ СПОСОБ: Создаем нового бота для отправки
+                            # Основной способ: Создаем нового бота для отправки
                             temp_bot = Bot(token=TELEGRAM_TOKEN)
                             
-                            # Проверяем, можем ли мы отправить сообщение
+                            # Отправляем сообщение
                             await temp_bot.send_message(
                                 chat_id=MY_USER_ID,
                                 text=message,
@@ -588,30 +599,15 @@ async def volume_spike_scanner():
                             logger.info(f"✅ АЛЕРТ УСПЕШНО ОТПРАВЛЕН: {symbol}")
                             sent_alerts[alert_id] = time.time()
                             
-                            # Также пытаемся через bot_instance для надежности
-                            if bot_instance:
-                                try:
-                                    await bot_instance.send_message(
-                                        chat_id=MY_USER_ID,
-                                        text=f"Дублирование: {symbol}",
-                                        disable_web_page_preview=True
-                                    )
-                                except:
-                                    pass
-                            
                         except Exception as e:
-                            logger.error(f"❌ ДЕТАЛЬНАЯ ОШИБКА ОТПРАВКИ АЛЕРТА {symbol}:")
-                            logger.error(f"   Тип ошибки: {type(e).__name__}")
-                            logger.error(f"   Сообщение: {str(e)}")
-                            logger.error(f"   Chat ID: {MY_USER_ID}")
-                            logger.error(f"   Token length: {len(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else 0}")
+                            logger.error(f"❌ ОШИБКА ОТПРАВКИ АЛЕРТА {symbol}: {str(e)}")
                             
                             # Пробуем упрощенное сообщение без кнопок
                             try:
                                 temp_bot = Bot(token=TELEGRAM_TOKEN)
                                 await temp_bot.send_message(
                                     chat_id=MY_USER_ID,
-                                    text=f"⚡ {symbol} | {prev_vol:,}→{curr_vol:,} (+{volume_change_pct:.0f}%)",
+                                    text=f"⚡ {symbol} | 5 мин: {prev_vol:,}→{curr_vol:,} (+{volume_change_pct:.0f}%)",
                                     disable_web_page_preview=True
                                 )
                                 logger.info(f"✅ Упрощенный алерт отправлен: {symbol}")
@@ -629,14 +625,14 @@ async def volume_spike_scanner():
             for exp in expired:
                 sent_alerts.pop(exp, None)
             
-            await asyncio.sleep(10)  # Уменьшаем паузу до 10 секунд для более частого сканирования
+            await asyncio.sleep(50)  # Проверяем каждые 50 секунд (чуть меньше 5 минут)
             
         except asyncio.CancelledError:
             logger.info("Сканер остановлен")
             break
         except Exception as e:
             logger.error(f"Ошибка в сканере: {e}")
-            await asyncio.sleep(30)
+            await asyncio.sleep(60)
 
 
 # ====================== TELEGRAM КОМАНДЫ И КНОПКИ ======================
@@ -673,13 +669,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     text = (
-        "📊 MEXC Volume Scanner\n\n"
+        "📊 MEXC 5-MIN Volume Scanner\n\n"
         f"Статус: ✅ Активен\n"
         f"Отслеживаемых пар: {len(tracked_symbols)}\n"
         f"В блэк-листе: {len(blacklist)} монет\n"
         f"Уведомления отключены: {len(paused_alerts)} монет\n\n"
         f"Фильтры:\n"
         f"• 1D объём < {DAILY_VOLUME_LIMIT:,} USDT\n"
+        f"• Пред. 5 мин < {MIN_PREV_VOLUME} USDT\n"
+        f"• Тек. 5 мин > {MIN_CURRENT_VOLUME} USDT\n"
+        f"• Минимальный рост: 300%\n"
         f"• Цена: {MIN_PRICE:.4f} - {MAX_PRICE:.2f} USDT\n\n"
         f"Выберите действие:"
     )
@@ -747,13 +746,16 @@ async def start_callback(query):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     text = (
-        "📊 MEXC Volume Scanner\n\n"
+        "📊 MEXC 5-MIN Volume Scanner\n\n"
         f"Статус: ✅ Активен\n"
         f"Отслеживаемых пар: {len(tracked_symbols)}\n"
         f"В блэк-листе: {len(blacklist)} монет\n"
         f"Уведомления отключены: {len(paused_alerts)} монет\n\n"
         f"Фильтры:\n"
         f"• 1D объём < {DAILY_VOLUME_LIMIT:,} USDT\n"
+        f"• Пред. 5 мин < {MIN_PREV_VOLUME} USDT\n"
+        f"• Тек. 5 мин > {MIN_CURRENT_VOLUME} USDT\n"
+        f"• Минимальный рост: 300%\n"
         f"• Цена: {MIN_PRICE:.4f} - {MAX_PRICE:.2f} USDT\n\n"
         f"Выберите действие:"
     )
@@ -937,7 +939,11 @@ async def env_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"MEXC_API_KEY: {'УСТАНОВЛЕН' if MEXC_API_KEY else 'НЕ УСТАНОВЛЕН'}\n"
         f"MEXC_SECRET_KEY: {'УСТАНОВЛЕН' if MEXC_SECRET_KEY else 'НЕ УСТАНОВЛЕН'}\n\n"
         f"Текущий user_id: {update.effective_user.id}\n"
-        f"Совпадает с MY_USER_ID: {'✅ ДА' if update.effective_user.id == MY_USER_ID else '❌ НЕТ'}"
+        f"Совпадает с MY_USER_ID: {'✅ ДА' if update.effective_user.id == MY_USER_ID else '❌ НЕТ'}\n\n"
+        f"Параметры сканера:\n"
+        f"MIN_PREV_VOLUME (пред. 5 мин): {MIN_PREV_VOLUME}\n"
+        f"MIN_CURRENT_VOLUME (тек. 5 мин): {MIN_CURRENT_VOLUME}\n"
+        f"DAILY_VOLUME_LIMIT: {DAILY_VOLUME_LIMIT:,}"
     )
     
     if update.message:
@@ -985,16 +991,16 @@ async def test_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Проверяем 1D объем
         daily_volume = await get_1d_volume(symbol)
         
-        # Проверяем 1m данные
-        data = await get_1m_kline_data(symbol)
+        # Проверяем 5m данные
+        data = await get_5m_kline_data(symbol)
         
-        message = f"📊 {symbol}\n\n"
+        message = f"📊 {symbol} (5-минутный интервал)\n\n"
         
         if data:
             message += (
-                f"1m данные:\n"
-                f"• Пред. объем: {data['prev_volume']:,}\n"
-                f"• Тек. объем: {data['curr_volume']:,}\n"
+                f"5m данные:\n"
+                f"• Пред. 5 мин объем: {data['prev_volume']:,}\n"
+                f"• Тек. 5 мин объем: {data['curr_volume']:,}\n"
                 f"• Пред. цена: {data['prev_price']:.8f}\n"
                 f"• Тек. цена: {data['curr_price']:.8f}\n\n"
             )
@@ -1003,21 +1009,27 @@ async def test_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conditions = []
             
             if data['prev_volume'] < MIN_PREV_VOLUME:
-                conditions.append(f"✓ Пред. объем < {MIN_PREV_VOLUME}")
+                conditions.append(f"✓ Пред. 5 мин < {MIN_PREV_VOLUME}")
             else:
-                conditions.append(f"✗ Пред. объем > {MIN_PREV_VOLUME}")
+                conditions.append(f"✗ Пред. 5 мин > {MIN_PREV_VOLUME}")
                 
             if data['curr_volume'] > MIN_CURRENT_VOLUME:
-                conditions.append(f"✓ Тек. объем > {MIN_CURRENT_VOLUME}")
+                conditions.append(f"✓ Тек. 5 мин > {MIN_CURRENT_VOLUME}")
             else:
-                conditions.append(f"✗ Тек. объем < {MIN_CURRENT_VOLUME}")
+                conditions.append(f"✗ Тек. 5 мин < {MIN_CURRENT_VOLUME}")
                 
             volume_change_pct = ((data['curr_volume'] - data['prev_volume']) / max(data['prev_volume'], 1)) * 100
             conditions.append(f"Изменение: {volume_change_pct:.0f}%")
             
-            message += "Условия:\n" + "\n".join(f"• {c}" for c in conditions)
+            # Проверяем дополнительное условие
+            if volume_change_pct >= 300:
+                conditions.append(f"✓ Рост >= 300%")
+            else:
+                conditions.append(f"✗ Рост < 300%")
+            
+            message += "Условия для алерта:\n" + "\n".join(f"• {c}" for c in conditions)
         else:
-            message += "❌ Нет 1m данных\n"
+            message += "❌ Нет 5m данных\n"
         
         message += f"\n1D объем: {daily_volume:,.0f} USDT"
         
@@ -1046,45 +1058,6 @@ async def test_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 
-async def force_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Принудительная проверка всех символов"""
-    if update.effective_user.id != MY_USER_ID:
-        return
-    
-    await safe_reply(update, "Начинаю принудительную проверку всех символов...")
-    
-    if not tracked_symbols:
-        await safe_reply(update, "Нет символов для проверки")
-        return
-    
-    symbols_to_check = list(tracked_symbols)[:50]  # Проверяем первые 50
-    alerts_found = 0
-    
-    for symbol in symbols_to_check:
-        try:
-            data = await get_1m_kline_data(symbol)
-            if data:
-                prev_vol = data["prev_volume"]
-                curr_vol = data["curr_volume"]
-                
-                if prev_vol < MIN_PREV_VOLUME and curr_vol > MIN_CURRENT_VOLUME:
-                    volume_change_pct = ((curr_vol - prev_vol) / max(prev_vol, 1)) * 100
-                    
-                    if volume_change_pct >= 50:
-                        alerts_found += 1
-                        
-                        await safe_reply(update,
-                            f"⚡ {symbol}\n"
-                            f"Объём: {prev_vol:,} → {curr_vol:,}\n"
-                            f"Изменение: +{volume_change_pct:.0f}%"
-                        )
-                        
-        except Exception as e:
-            continue
-    
-    await safe_reply(update, f"Проверка завершена. Найдено алертов: {alerts_found}")
-
-
 async def send_test_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отправить тестовый алерт прямо сейчас"""
     if update.effective_user.id != MY_USER_ID:
@@ -1095,8 +1068,8 @@ async def send_test_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # Создаем тестовый алерт
         message = (
-            f"⚡ ТЕСТОВЫЙ АЛЕРТ: {test_symbol}\n"
-            f"Объём: 61 → 6,438 USDT\n"
+            f"⚡ ТЕСТОВЫЙ АЛЕРТ (5-минутный): {test_symbol}\n"
+            f"Объём за 5 мин: 61 → 6,438 USDT\n"
             f"Изменение: +10454%\n"
             f"Цена: -0.10%\n"
             f"https://www.mexc.com/futures/{test_symbol[:-4]}_USDT"
@@ -1173,7 +1146,7 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sample_symbols = list(tracked_symbols)[:5] if tracked_symbols else []
     
     debug_info = (
-        f"🔧 Отладка\n\n"
+        f"🔧 Отладка 5-минутного сканера\n\n"
         f"Всего пар: {len(tracked_symbols)}\n"
         f"В блэк-листе: {len(blacklist)}\n"
         f"Паузы: {len(paused_alerts)}\n"
@@ -1184,18 +1157,19 @@ async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Проверяем несколько символов
     for symbol in sample_symbols:
         try:
-            data = await get_1m_kline_data(symbol)
+            data = await get_5m_kline_data(symbol)
             if data:
-                debug_info += f"• {symbol}: {data['prev_volume']:,} → {data['curr_volume']:,} USDT\n"
+                debug_info += f"• {symbol}: {data['prev_volume']:,} → {data['curr_volume']:,} USDT за 5 мин\n"
             else:
                 debug_info += f"• {symbol}: нет данных\n"
         except:
             debug_info += f"• {symbol}: ошибка\n"
     
     debug_info += f"\nФильтры:\n"
-    debug_info += f"MIN_PREV_VOLUME: {MIN_PREV_VOLUME}\n"
-    debug_info += f"MIN_CURRENT_VOLUME: {MIN_CURRENT_VOLUME}\n"
+    debug_info += f"MIN_PREV_VOLUME (пред. 5 мин): {MIN_PREV_VOLUME}\n"
+    debug_info += f"MIN_CURRENT_VOLUME (тек. 5 мин): {MIN_CURRENT_VOLUME}\n"
     debug_info += f"DAILY_VOLUME_LIMIT: {DAILY_VOLUME_LIMIT:,}\n"
+    debug_info += f"Минимальный рост: 300%\n"
     debug_info += f"MY_USER_ID: {MY_USER_ID}\n"
     
     # Отправляем сообщение
@@ -1226,7 +1200,7 @@ async def run_telegram_polling():
 async def lifespan(app: FastAPI):
     global scanner_task, application, bot_instance
     
-    logger.info("=== Запуск MEXC Volume Scanner ===")
+    logger.info("=== Запуск MEXC 5-MIN Volume Scanner ===")
     
     # Проверка токена
     logger.info(f"TELEGRAM_TOKEN: {'*' * len(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else 'НЕ УСТАНОВЛЕН'}")
@@ -1257,7 +1231,6 @@ async def lifespan(app: FastAPI):
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("debug", debug))
     application.add_handler(CommandHandler("test", test_symbol))
-    application.add_handler(CommandHandler("check", force_check))
     application.add_handler(CommandHandler("env", env_check))
     application.add_handler(CommandHandler("testalert", send_test_alert))
     application.add_handler(CallbackQueryHandler(button_handler))
@@ -1267,7 +1240,7 @@ async def lifespan(app: FastAPI):
     
     # Запускаем сканер
     scanner_task = asyncio.create_task(volume_spike_scanner())
-    logger.info("✅ Сканер запущен")
+    logger.info("✅ 5-минутный сканер запущен")
     
     # Запускаем Telegram polling
     asyncio.create_task(run_telegram_polling())
@@ -1294,7 +1267,7 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/")
 async def root():
     return {
-        "service": "MEXC Volume Scanner",
+        "service": "MEXC 5-MIN Volume Scanner",
         "status": "active",
         "timestamp": datetime.now().isoformat(),
         "tracked_pairs": len(tracked_symbols),
