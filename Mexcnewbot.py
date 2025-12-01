@@ -35,7 +35,7 @@ if not MY_USER_ID:
 MEXC_API_KEY = os.getenv("MEXC_API_KEY", "")
 MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "")
 
-DAILY_VOLUME_LIMIT = 500_000
+DAILY_VOLUME_LIMIT = 800_000
 MIN_PREV_VOLUME = 1000
 MIN_CURRENT_VOLUME = 2200
 MIN_PRICE = 0.0001
@@ -1120,6 +1120,7 @@ if __name__ == "__main__":
         port=port,
         reload=False
     )
+
 
 
 
