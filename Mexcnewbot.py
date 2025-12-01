@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 import uvicorn
 from datetime import datetime, timedelta
+import html
 
 # ====================== НАСТРОЙКИ ======================
 load_dotenv()
@@ -345,21 +346,20 @@ async def load_and_filter_symbols():
         
         if tracked_symbols:
             sample = list(tracked_symbols)[:15]
-            logger.info(f"   Примеры: {', '.join(sample)}")
             
+            # Отправляем уведомление без HTML
             try:
                 await bot_instance.send_message(
                     chat_id=MY_USER_ID,
-                    text=f"✅ <b>Сканер запущен</b>\n\n"
-                         f"<b>Отслеживается:</b> {len(tracked_symbols)} пар\n"
-                         f"<b>В блэк-листе:</b> {len(blacklist)} монет\n"
-                         f"<b>Уведомления отключены:</b> {len(paused_alerts)} монет\n\n"
-                         f"<b>Фильтры:</b>\n"
+                    text=f"✅ Сканер запущен\n\n"
+                         f"Отслеживается: {len(tracked_symbols)} пар\n"
+                         f"В блэк-листе: {len(blacklist)} монет\n"
+                         f"Уведомления отключены: {len(paused_alerts)} монет\n\n"
+                         f"Фильтры:\n"
                          f"• 1D объём < {DAILY_VOLUME_LIMIT:,} USDT\n"
                          f"• Цена: {MIN_PRICE:.4f} - {MAX_PRICE:.2f} USDT\n"
                          f"• Исключены акции\n\n"
-                         f"<b>Примеры:</b>\n{', '.join(sample[:8])}",
-                    parse_mode="HTML"
+                         f"Примеры:\n{', '.join(sample[:8])}"
                 )
             except Exception as e:
                 logger.error(f"Не удалось отправить уведомление: {e}")
@@ -416,14 +416,12 @@ async def toggle_pause_symbol(query, symbol: str):
             action = "отключены"
         
         await query.edit_message_text(
-            f"✅ Уведомления для <b>{symbol}</b> {action}",
-            parse_mode="HTML"
+            f"✅ Уведомления для {symbol} {action}"
         )
     except Exception as e:
         logger.error(f"Ошибка переключения паузы: {e}")
         await query.edit_message_text(
-            f"❌ Ошибка при изменении настроек",
-            parse_mode="HTML"
+            f"❌ Ошибка при изменении настроек"
         )
 
 
@@ -432,8 +430,7 @@ async def add_to_blacklist(query, symbol: str):
     try:
         if symbol in blacklist:
             await query.edit_message_text(
-                f"ℹ️ <b>{symbol}</b> уже в блэк-листе",
-                parse_mode="HTML"
+                f"ℹ️ {symbol} уже в блэк-листе"
             )
             return
         
@@ -451,16 +448,14 @@ async def add_to_blacklist(query, symbol: str):
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
-            f"✅ <b>{symbol}</b> добавлен в блэк-лист\n\n"
+            f"✅ {symbol} добавлен в блэк-лист\n\n"
             f"Монета исключена из отслеживания",
-            parse_mode="HTML",
             reply_markup=reply_markup
         )
     except Exception as e:
         logger.error(f"Ошибка добавления в блэк-лист: {e}")
         await query.edit_message_text(
-            f"❌ Ошибка при добавлении в блэк-лист",
-            parse_mode="HTML"
+            f"❌ Ошибка при добавлении в блэк-лист"
         )
 
 
@@ -469,23 +464,20 @@ async def remove_from_blacklist(query, symbol: str):
     try:
         if symbol not in blacklist:
             await query.edit_message_text(
-                f"ℹ️ <b>{symbol}</b> нет в блэк-листе",
-                parse_mode="HTML"
+                f"ℹ️ {symbol} нет в блэк-листе"
             )
             return
         
         blacklist.remove(symbol)
         
         await query.edit_message_text(
-            f"✅ <b>{symbol}</b> удален из блэк-листа\n\n"
-            f"Монета будет проверена при следующем обновлении списка",
-            parse_mode="HTML"
+            f"✅ {symbol} удален из блэк-листа\n\n"
+            f"Монета будет проверена при следующем обновлении списка"
         )
     except Exception as e:
         logger.error(f"Ошибка удаления из блэк-листа: {e}")
         await query.edit_message_text(
-            f"❌ Ошибка при удалении из блэк-листа",
-            parse_mode="HTML"
+            f"❌ Ошибка при удалении из блэк-листа"
         )
 
 
@@ -569,19 +561,19 @@ async def volume_spike_scanner():
                         ]
                         reply_markup = InlineKeyboardMarkup(keyboard)
                         
+                        # Сообщение без HTML тегов
                         message = (
-                            f"<b>⚡ {symbol}</b>\n"
-                            f"Объём: {prev_vol:,} → <b>{curr_vol:,}</b> USDT\n"
-                            f"Изменение: <b>{volume_change_pct:+.0f}%</b>\n"
-                            f"Цена: <b>{price_change_pct:+.2f}%</b>\n"
-                            f"<a href='https://www.mexc.com/futures/{symbol[:-4]}_USDT'>📊</a>"
+                            f"⚡ {symbol}\n"
+                            f"Объём: {prev_vol:,} → {curr_vol:,} USDT\n"
+                            f"Изменение: {volume_change_pct:+.0f}%\n"
+                            f"Цена: {price_change_pct:+.2f}%\n"
+                            f"https://www.mexc.com/futures/{symbol[:-4]}_USDT"
                         )
                         
                         try:
                             await bot_instance.send_message(
                                 chat_id=MY_USER_ID,
                                 text=message,
-                                parse_mode="HTML",
                                 disable_web_page_preview=True,
                                 reply_markup=reply_markup
                             )
@@ -627,7 +619,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Упрощенный текст без потенциально проблемных HTML тегов
     text = (
         "📊 MEXC Volume Scanner\n\n"
         f"Статус: ✅ Активен\n"
@@ -698,7 +689,6 @@ async def start_callback(query):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Упрощенный текст без потенциально проблемных HTML тегов
     text = (
         "📊 MEXC Volume Scanner\n\n"
         f"Статус: ✅ Активен\n"
@@ -732,11 +722,10 @@ async def show_symbols_list(query):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await query.edit_message_text(
-        f"<b>📋 Отслеживаемые пары</b>\n\n"
+        f"📋 Отслеживаемые пары\n\n"
         f"Всего: {len(tracked_symbols)} пар\n\n"
         f"{symbols_text}\n\n"
-        f"<i>Показано {min(20, len(symbols_list))} из {len(symbols_list)}</i>",
-        parse_mode="HTML",
+        f"Показано {min(20, len(symbols_list))} из {len(symbols_list)}",
         reply_markup=reply_markup
     )
 
@@ -748,9 +737,8 @@ async def show_blacklist_menu(query):
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
-            f"<b>🚫 Блэк-лист</b>\n\n"
+            f"🚫 Блэк-лист\n\n"
             f"В блэк-листе нет монет",
-            parse_mode="HTML",
             reply_markup=reply_markup
         )
         return
@@ -762,11 +750,10 @@ async def show_blacklist_menu(query):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await query.edit_message_text(
-        f"<b>🚫 Блэк-лист</b>\n\n"
+        f"🚫 Блэк-лист\n\n"
         f"Всего: {len(blacklist)} монет\n\n"
         f"{blacklist_text}\n\n"
-        f"<i>Показано {min(15, len(blacklist_list))} из {len(blacklist_list)}</i>",
-        parse_mode="HTML",
+        f"Показано {min(15, len(blacklist_list))} из {len(blacklist_list)}",
         reply_markup=reply_markup
     )
 
@@ -778,9 +765,8 @@ async def show_paused_menu(query):
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await query.edit_message_text(
-            f"<b>🔕 Отключенные уведомления</b>\n\n"
+            f"🔕 Отключенные уведомления\n\n"
             f"Нет отключенных уведомлений",
-            parse_mode="HTML",
             reply_markup=reply_markup
         )
         return
@@ -792,11 +778,10 @@ async def show_paused_menu(query):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await query.edit_message_text(
-        f"<b>🔕 Отключенные уведомления</b>\n\n"
+        f"🔕 Отключенные уведомления\n\n"
         f"Всего: {len(paused_alerts)} монет\n\n"
         f"{paused_text}\n\n"
-        f"<i>Показано {min(15, len(paused_list))} из {len(paused_list)}</i>",
-        parse_mode="HTML",
+        f"Показано {min(15, len(paused_list))} из {len(paused_list)}",
         reply_markup=reply_markup
     )
 
@@ -811,8 +796,7 @@ async def refresh_symbols(query):
         await query.edit_message_text(
             f"✅ Обновлено!\n"
             f"Отслеживается: {len(tracked_symbols)} пар\n"
-            f"В блэк-листе: {len(blacklist)} монет",
-            parse_mode="HTML"
+            f"В блэк-листе: {len(blacklist)} монет"
         )
     else:
         await query.edit_message_text("❌ Ошибка обновления")
@@ -834,21 +818,21 @@ async def stats_db_query(query):
         
         top_symbols = sorted(symbol_counts.items(), key=lambda x: x[1], reverse=True)[:5]
         
-        stats_text = f"<b>📊 Статистика за 24ч</b>\n\n"
-        stats_text += f"<b>Всего алертов:</b> {alert_count}\n"
-        stats_text += f"<b>Уникальных пар:</b> {unique_symbols}\n"
-        stats_text += f"<b>В блэк-листе:</b> {len(blacklist)}\n"
-        stats_text += f"<b>Пауз уведомлений:</b> {len(paused_alerts)}\n\n"
+        stats_text = "📊 Статистика за 24ч\n\n"
+        stats_text += f"Всего алертов: {alert_count}\n"
+        stats_text += f"Уникальных пар: {unique_symbols}\n"
+        stats_text += f"В блэк-листе: {len(blacklist)}\n"
+        stats_text += f"Пауз уведомлений: {len(paused_alerts)}\n\n"
         
         if top_symbols:
-            stats_text += "<b>Топ-5 активных пар:</b>\n"
+            stats_text += "Топ-5 активных пар:\n"
             for symbol, count in top_symbols:
                 stats_text += f"• {symbol}: {count} алертов\n"
         
         keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await query.edit_message_text(stats_text, parse_mode="HTML", reply_markup=reply_markup)
+        await query.edit_message_text(stats_text, reply_markup=reply_markup)
         
     except Exception as e:
         logger.error(f"Ошибка получения статистики: {e}")
@@ -866,15 +850,17 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         alert_count = len(recent_alerts)
         unique_symbols = len(set([alert['symbol'] for alert in recent_alerts]))
         
-        stats_text = f"<b>📊 Статистика за 24ч</b>\n\n"
-        stats_text += f"<b>Всего алертов:</b> {alert_count}\n"
-        stats_text += f"<b>Уникальных пар:</b> {unique_symbols}\n"
-        stats_text += f"<b>Отслеживаемых пар:</b> {len(tracked_symbols)}\n"
-        stats_text += f"<b>В блэк-листе:</b> {len(blacklist)}\n"
-        stats_text += f"<b>Пауз уведомлений:</b> {len(paused_alerts)}\n\n"
-        stats_text += f"<b>Время:</b> {datetime.now().strftime('%H:%M:%S')}"
+        stats_text = (
+            "📊 Статистика за 24ч\n\n"
+            f"Всего алертов: {alert_count}\n"
+            f"Уникальных пар: {unique_symbols}\n"
+            f"Отслеживаемых пар: {len(tracked_symbols)}\n"
+            f"В блэк-листе: {len(blacklist)}\n"
+            f"Пауз уведомлений: {len(paused_alerts)}\n\n"
+            f"Время: {datetime.now().strftime('%H:%M:%S')}"
+        )
         
-        await update.message.reply_text(stats_text, parse_mode="HTML")
+        await update.message.reply_text(stats_text)
         
     except Exception as e:
         logger.error(f"Ошибка получения статистики: {e}")
