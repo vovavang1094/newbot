@@ -1,13 +1,17 @@
 import os
 import time
+import hmac
+import hashlib
 import logging
 import aiohttp
 import asyncio
+from dotenv import load_dotenv  # <-- ОБЯЗАТЕЛЬНО
 from telegram import Bot, Update
 from telegram.ext import Application, ContextTypes, CommandHandler
 from fastapi import FastAPI
+from contextlib import asynccontextmanager
 import uvicorn
-import threading
+from datetime import datetime, timedelta
 
 # ====================== НАСТРОЙКИ ======================
 load_dotenv()
@@ -174,6 +178,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен")
+
 
 
 
