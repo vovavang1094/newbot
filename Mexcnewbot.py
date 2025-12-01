@@ -21,21 +21,10 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MY_USER_ID = int(os.getenv("MY_USER_ID", 0))
 
-# ПРОВЕРКА ОБЯЗАТЕЛЬНЫХ ПЕРЕМЕННЫХ
-if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "ваш_токен_бота":
-    print("❌ ОШИБКА: TELEGRAM_TOKEN не установлен!")
-    print("Пожалуйста, установите переменную окружения TELEGRAM_TOKEN на Render")
-    exit(1)
-
-if not MY_USER_ID:
-    print("❌ ОШИБКА: MY_USER_ID не установлен!")
-    print("Пожалуйста, установите переменную окружения MY_USER_ID на Render")
-    exit(1)
-
 MEXC_API_KEY = os.getenv("MEXC_API_KEY", "")
 MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "")
 
-DAILY_VOLUME_LIMIT = 800_000
+DAILY_VOLUME_LIMIT = 500_000
 MIN_PREV_VOLUME = 1000
 MIN_CURRENT_VOLUME = 2200
 MIN_PRICE = 0.0001
@@ -350,20 +339,24 @@ async def load_and_filter_symbols():
             
             # Отправляем уведомление без HTML
             try:
-                await bot_instance.send_message(
-                    chat_id=MY_USER_ID,
-                    text=f"✅ Сканер запущен\n\n"
-                         f"Отслеживается: {len(tracked_symbols)} пар\n"
-                         f"В блэк-листе: {len(blacklist)} монет\n"
-                         f"Уведомления отключены: {len(paused_alerts)} монет\n\n"
-                         f"Фильтры:\n"
-                         f"• 1D объём < {DAILY_VOLUME_LIMIT:,} USDT\n"
-                         f"• Цена: {MIN_PRICE:.4f} - {MAX_PRICE:.2f} USDT\n"
-                         f"• Исключены акции\n\n"
-                         f"Примеры:\n{', '.join(sample[:8])}"
-                )
+                if bot_instance:
+                    await bot_instance.send_message(
+                        chat_id=MY_USER_ID,
+                        text=f"✅ Сканер запущен\n\n"
+                             f"Отслеживается: {len(tracked_symbols)} пар\n"
+                             f"В блэк-листе: {len(blacklist)} монет\n"
+                             f"Уведомления отключены: {len(paused_alerts)} монет\n\n"
+                             f"Фильтры:\n"
+                             f"• 1D объём < {DAILY_VOLUME_LIMIT:,} USDT\n"
+                             f"• Цена: {MIN_PRICE:.4f} - {MAX_PRICE:.2f} USDT\n"
+                             f"• Исключены акции\n\n"
+                             f"Примеры:\n{', '.join(sample[:8])}"
+                    )
+                    logger.info("✅ Стартовое сообщение отправлено")
+                else:
+                    logger.error("❌ bot_instance не инициализирован для отправки стартового сообщения")
             except Exception as e:
-                logger.error(f"Не удалось отправить уведомление: {e}")
+                logger.error(f"❌ Не удалось отправить стартовое уведомление: {e}")
         
         return True
         
@@ -486,6 +479,7 @@ async def remove_from_blacklist(query, symbol: str):
 async def volume_spike_scanner():
     """Сканируем все низковольюмные пары на всплески объёма на 1m"""
     logger.info(f"🚀 Сканер запущен! Отслеживаю {len(tracked_symbols)} пар")
+    logger.info(f"Ваш USER_ID: {MY_USER_ID}")
     
     if len(tracked_symbols) == 0:
         logger.warning("Нет пар для отслеживания!")
@@ -513,8 +507,8 @@ async def volume_spike_scanner():
                 await asyncio.sleep(60)
                 continue
             
-            # Увеличиваем количество символов для сканирования
-            max_per_iteration = min(200, len(symbols_list))
+            # Сканируем все символы
+            max_per_iteration = len(symbols_list)
             random.shuffle(symbols_list)
             
             for symbol in symbols_list[:max_per_iteration]:
@@ -549,7 +543,7 @@ async def volume_spike_scanner():
                             continue
                         
                         # Логируем для отладки
-                        logger.info(f"🚨 АЛЕРТ: {symbol} | {prev_vol:,}→{curr_vol:,} (+{volume_change_pct:.0f}%)")
+                        logger.info(f"🚨 АЛЕРТ НАЙДЕН: {symbol} | {prev_vol:,}→{curr_vol:,} (+{volume_change_pct:.0f}%)")
                         
                         # Сохраняем алерт в историю
                         await save_alert_to_history(
@@ -577,18 +571,53 @@ async def volume_spike_scanner():
                         )
                         
                         try:
-                            await bot_instance.send_message(
+                            # Логируем попытку отправки
+                            logger.info(f"Попытка отправить алерт {symbol} на chat_id: {MY_USER_ID}")
+                            
+                            # ОСНОВНОЙ СПОСОБ: Создаем нового бота для отправки
+                            temp_bot = Bot(token=TELEGRAM_TOKEN)
+                            
+                            # Проверяем, можем ли мы отправить сообщение
+                            await temp_bot.send_message(
                                 chat_id=MY_USER_ID,
                                 text=message,
                                 disable_web_page_preview=True,
                                 reply_markup=reply_markup
                             )
                             
+                            logger.info(f"✅ АЛЕРТ УСПЕШНО ОТПРАВЛЕН: {symbol}")
                             sent_alerts[alert_id] = time.time()
-                            logger.info(f"🚨 АЛЕРТ ОТПРАВЛЕН: {symbol} | {prev_vol:,}→{curr_vol:,} (+{volume_change_pct:.0f}%)")
+                            
+                            # Также пытаемся через bot_instance для надежности
+                            if bot_instance:
+                                try:
+                                    await bot_instance.send_message(
+                                        chat_id=MY_USER_ID,
+                                        text=f"Дублирование: {symbol}",
+                                        disable_web_page_preview=True
+                                    )
+                                except:
+                                    pass
                             
                         except Exception as e:
-                            logger.error(f"Ошибка отправки: {e}")
+                            logger.error(f"❌ ДЕТАЛЬНАЯ ОШИБКА ОТПРАВКИ АЛЕРТА {symbol}:")
+                            logger.error(f"   Тип ошибки: {type(e).__name__}")
+                            logger.error(f"   Сообщение: {str(e)}")
+                            logger.error(f"   Chat ID: {MY_USER_ID}")
+                            logger.error(f"   Token length: {len(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else 0}")
+                            
+                            # Пробуем упрощенное сообщение без кнопок
+                            try:
+                                temp_bot = Bot(token=TELEGRAM_TOKEN)
+                                await temp_bot.send_message(
+                                    chat_id=MY_USER_ID,
+                                    text=f"⚡ {symbol} | {prev_vol:,}→{curr_vol:,} (+{volume_change_pct:.0f}%)",
+                                    disable_web_page_preview=True
+                                )
+                                logger.info(f"✅ Упрощенный алерт отправлен: {symbol}")
+                                sent_alerts[alert_id] = time.time()
+                            except Exception as e2:
+                                logger.error(f"❌ Ошибка упрощенной отправки: {e2}")
                             
                 except Exception as e:
                     logger.debug(f"Ошибка обработки {symbol}: {str(e)[:100]}")
@@ -600,7 +629,7 @@ async def volume_spike_scanner():
             for exp in expired:
                 sent_alerts.pop(exp, None)
             
-            await asyncio.sleep(20)  # Уменьшили паузу для более частого сканирования
+            await asyncio.sleep(10)  # Уменьшаем паузу до 10 секунд для более частого сканирования
             
         except asyncio.CancelledError:
             logger.info("Сканер остановлен")
@@ -611,9 +640,27 @@ async def volume_spike_scanner():
 
 
 # ====================== TELEGRAM КОМАНДЫ И КНОПКИ ======================
+async def safe_reply(update: Update, text: str):
+    """Безопасная отправка сообщения"""
+    try:
+        if update.message:
+            await update.message.reply_text(text)
+        elif update.callback_query and update.callback_query.message:
+            await update.callback_query.message.reply_text(text)
+        elif bot_instance:
+            await bot_instance.send_message(
+                chat_id=MY_USER_ID,
+                text=text
+            )
+        else:
+            logger.error(f"Не удалось отправить сообщение: {text}")
+    except Exception as e:
+        logger.error(f"Ошибка при отправке сообщения: {e}")
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MY_USER_ID:
-        await update.message.reply_text("🚫 Доступ запрещён")
+        await safe_reply(update, "🚫 Доступ запрещён")
         return
     
     keyboard = [
@@ -637,10 +684,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Выберите действие:"
     )
     
-    await update.message.reply_text(
-        text,
-        reply_markup=reply_markup
-    )
+    if update.message:
+        await update.message.reply_text(text, reply_markup=reply_markup)
+    elif bot_instance:
+        await bot_instance.send_message(
+            chat_id=MY_USER_ID,
+            text=text,
+            reply_markup=reply_markup
+        )
 
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -874,56 +925,61 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ====================== ОТЛАДОЧНЫЕ КОМАНДЫ ======================
-async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда для отладки"""
+async def env_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка переменных окружения"""
     if update.effective_user.id != MY_USER_ID:
         return
     
-    # Получаем статистику по текущим символам
-    sample_symbols = list(tracked_symbols)[:5]
-    
-    debug_info = (
-        f"🔧 Отладка\n\n"
-        f"Всего пар: {len(tracked_symbols)}\n"
-        f"В блэк-листе: {len(blacklist)}\n"
-        f"Паузы: {len(paused_alerts)}\n"
-        f"Алертов за сессию: {len(sent_alerts)}\n\n"
-        f"Примеры пар:\n"
+    check_text = (
+        f"🔍 Проверка переменных окружения:\n\n"
+        f"TELEGRAM_TOKEN: {'УСТАНОВЛЕН' if TELEGRAM_TOKEN and TELEGRAM_TOKEN != 'ваш_токен_бота' else '❌ НЕ УСТАНОВЛЕН'}\n"
+        f"MY_USER_ID: {MY_USER_ID}\n"
+        f"MEXC_API_KEY: {'УСТАНОВЛЕН' if MEXC_API_KEY else 'НЕ УСТАНОВЛЕН'}\n"
+        f"MEXC_SECRET_KEY: {'УСТАНОВЛЕН' if MEXC_SECRET_KEY else 'НЕ УСТАНОВЛЕН'}\n\n"
+        f"Текущий user_id: {update.effective_user.id}\n"
+        f"Совпадает с MY_USER_ID: {'✅ ДА' if update.effective_user.id == MY_USER_ID else '❌ НЕТ'}"
     )
     
-    # Проверяем несколько символов
-    for symbol in sample_symbols:
-        try:
-            data = await get_1m_kline_data(symbol)
-            if data:
-                debug_info += f"• {symbol}: {data['prev_volume']:,} → {data['curr_volume']:,} USDT\n"
-            else:
-                debug_info += f"• {symbol}: нет данных\n"
-        except:
-            debug_info += f"• {symbol}: ошибка\n"
-    
-    debug_info += f"\nФильтры:\n"
-    debug_info += f"MIN_PREV_VOLUME: {MIN_PREV_VOLUME}\n"
-    debug_info += f"MIN_CURRENT_VOLUME: {MIN_CURRENT_VOLUME}\n"
-    debug_info += f"DAILY_VOLUME_LIMIT: {DAILY_VOLUME_LIMIT:,}\n"
-    
-    await update.message.reply_text(debug_info)
+    if update.message:
+        await update.message.reply_text(check_text)
+    elif bot_instance:
+        await bot_instance.send_message(chat_id=MY_USER_ID, text=check_text)
 
 
 async def test_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Протестировать конкретный символ"""
     if update.effective_user.id != MY_USER_ID:
+        # Если нет сообщения, отправляем через бота
+        if bot_instance:
+            await bot_instance.send_message(
+                chat_id=MY_USER_ID,
+                text="🚫 Доступ запрещён"
+            )
         return
     
     if not context.args:
-        await update.message.reply_text("Укажите символ: /test BTCUSDT")
+        # Проверяем, есть ли message для ответа
+        if update.message:
+            await update.message.reply_text("Укажите символ: /test BTCUSDT")
+        elif bot_instance:
+            await bot_instance.send_message(
+                chat_id=MY_USER_ID,
+                text="Укажите символ: /test BTCUSDT"
+            )
         return
     
     symbol = context.args[0].upper()
     if not symbol.endswith("USDT"):
         symbol = f"{symbol}USDT"
     
-    await update.message.reply_text(f"Тестирую {symbol}...")
+    # Отправляем сообщение о начале теста
+    if update.message:
+        await update.message.reply_text(f"Тестирую {symbol}...")
+    elif bot_instance:
+        await bot_instance.send_message(
+            chat_id=MY_USER_ID,
+            text=f"Тестирую {symbol}..."
+        )
     
     try:
         # Проверяем 1D объем
@@ -970,10 +1026,24 @@ async def test_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             message += f" ( < {DAILY_VOLUME_LIMIT:,} - ОК)"
         
-        await update.message.reply_text(message)
+        # Отправляем результат
+        if update.message:
+            await update.message.reply_text(message)
+        elif bot_instance:
+            await bot_instance.send_message(
+                chat_id=MY_USER_ID,
+                text=message
+            )
         
     except Exception as e:
-        await update.message.reply_text(f"Ошибка: {str(e)}")
+        error_msg = f"Ошибка: {str(e)}"
+        if update.message:
+            await update.message.reply_text(error_msg)
+        elif bot_instance:
+            await bot_instance.send_message(
+                chat_id=MY_USER_ID,
+                text=error_msg
+            )
 
 
 async def force_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -981,10 +1051,10 @@ async def force_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != MY_USER_ID:
         return
     
-    await update.message.reply_text("Начинаю принудительную проверку всех символов...")
+    await safe_reply(update, "Начинаю принудительную проверку всех символов...")
     
     if not tracked_symbols:
-        await update.message.reply_text("Нет символов для проверки")
+        await safe_reply(update, "Нет символов для проверки")
         return
     
     symbols_to_check = list(tracked_symbols)[:50]  # Проверяем первые 50
@@ -1003,7 +1073,7 @@ async def force_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if volume_change_pct >= 50:
                         alerts_found += 1
                         
-                        await update.message.reply_text(
+                        await safe_reply(update,
                             f"⚡ {symbol}\n"
                             f"Объём: {prev_vol:,} → {curr_vol:,}\n"
                             f"Изменение: +{volume_change_pct:.0f}%"
@@ -1012,7 +1082,132 @@ async def force_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             continue
     
-    await update.message.reply_text(f"Проверка завершена. Найдено алертов: {alerts_found}")
+    await safe_reply(update, f"Проверка завершена. Найдено алертов: {alerts_found}")
+
+
+async def send_test_alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправить тестовый алерт прямо сейчас"""
+    if update.effective_user.id != MY_USER_ID:
+        return
+    
+    test_symbol = "HIPPOUSDT" if not context.args else context.args[0].upper()
+    
+    try:
+        # Создаем тестовый алерт
+        message = (
+            f"⚡ ТЕСТОВЫЙ АЛЕРТ: {test_symbol}\n"
+            f"Объём: 61 → 6,438 USDT\n"
+            f"Изменение: +10454%\n"
+            f"Цена: -0.10%\n"
+            f"https://www.mexc.com/futures/{test_symbol[:-4]}_USDT"
+        )
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("🔕 Выключить увед.", callback_data=f"pause_{test_symbol}"),
+                InlineKeyboardButton("🚫 В блэк-лист", callback_data=f"blacklist_{test_symbol}")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Пробуем все способы отправки
+        methods = []
+        
+        # Способ 1: через reply
+        if update.message:
+            try:
+                await update.message.reply_text(message, reply_markup=reply_markup, disable_web_page_preview=True)
+                methods.append("reply_text")
+            except Exception as e:
+                logger.error(f"Ошибка reply_text: {e}")
+        
+        # Способ 2: через создание нового бота
+        try:
+            temp_bot = Bot(token=TELEGRAM_TOKEN)
+            await temp_bot.send_message(
+                chat_id=MY_USER_ID,
+                text=message,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+            methods.append("новый бот")
+        except Exception as e:
+            logger.error(f"Ошибка нового бота: {e}")
+        
+        # Способ 3: через bot_instance
+        if bot_instance:
+            try:
+                await bot_instance.send_message(
+                    chat_id=MY_USER_ID,
+                    text=message,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True
+                )
+                methods.append("bot_instance")
+            except Exception as e:
+                logger.error(f"Ошибка bot_instance: {e}")
+        
+        # Отправляем отчет
+        report = f"Тестовый алерт отправлен для {test_symbol}\nИспользованные методы: {', '.join(methods) if methods else 'ни один не сработал'}"
+        
+        if update.message:
+            await update.message.reply_text(report)
+        elif bot_instance:
+            await bot_instance.send_message(chat_id=MY_USER_ID, text=report)
+        
+    except Exception as e:
+        logger.error(f"Ошибка в send_test_alert: {e}")
+
+
+async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда для отладки"""
+    if update.effective_user.id != MY_USER_ID:
+        if bot_instance:
+            await bot_instance.send_message(
+                chat_id=MY_USER_ID,
+                text="🚫 Попытка доступа от постороннего пользователя"
+            )
+        return
+    
+    # Получаем статистику по текущим символам
+    sample_symbols = list(tracked_symbols)[:5] if tracked_symbols else []
+    
+    debug_info = (
+        f"🔧 Отладка\n\n"
+        f"Всего пар: {len(tracked_symbols)}\n"
+        f"В блэк-листе: {len(blacklist)}\n"
+        f"Паузы: {len(paused_alerts)}\n"
+        f"Алертов за сессию: {len(sent_alerts)}\n\n"
+        f"Примеры пар ({len(sample_symbols)}):\n"
+    )
+    
+    # Проверяем несколько символов
+    for symbol in sample_symbols:
+        try:
+            data = await get_1m_kline_data(symbol)
+            if data:
+                debug_info += f"• {symbol}: {data['prev_volume']:,} → {data['curr_volume']:,} USDT\n"
+            else:
+                debug_info += f"• {symbol}: нет данных\n"
+        except:
+            debug_info += f"• {symbol}: ошибка\n"
+    
+    debug_info += f"\nФильтры:\n"
+    debug_info += f"MIN_PREV_VOLUME: {MIN_PREV_VOLUME}\n"
+    debug_info += f"MIN_CURRENT_VOLUME: {MIN_CURRENT_VOLUME}\n"
+    debug_info += f"DAILY_VOLUME_LIMIT: {DAILY_VOLUME_LIMIT:,}\n"
+    debug_info += f"MY_USER_ID: {MY_USER_ID}\n"
+    
+    # Отправляем сообщение
+    if update.message:
+        await update.message.reply_text(debug_info)
+    elif bot_instance:
+        await bot_instance.send_message(
+            chat_id=MY_USER_ID,
+            text=debug_info
+        )
+    else:
+        logger.error("Не удалось отправить debug сообщение - нет доступных методов")
 
 
 async def run_telegram_polling():
@@ -1063,6 +1258,8 @@ async def lifespan(app: FastAPI):
     application.add_handler(CommandHandler("debug", debug))
     application.add_handler(CommandHandler("test", test_symbol))
     application.add_handler(CommandHandler("check", force_check))
+    application.add_handler(CommandHandler("env", env_check))
+    application.add_handler(CommandHandler("testalert", send_test_alert))
     application.add_handler(CallbackQueryHandler(button_handler))
     
     # Загружаем и фильтруем символы
@@ -1113,13 +1310,16 @@ async def health():
 
 # ====================== ЗАПУСК ======================
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
+    port = int(os.environ.get("PORT", 10000))
+    logger.info(f"Запуск сервера на порту {port}")
+    
     uvicorn.run(
-        "Mexcnewbot:app",
+        app,
         host="0.0.0.0",
         port=port,
         reload=False
     )
+
 
 
 
