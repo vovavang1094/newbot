@@ -10,8 +10,13 @@ import uvicorn
 import threading
 
 # ====================== НАСТРОЙКИ ======================
+load_dotenv()
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-MY_USER_ID = int(os.getenv("MY_USER_ID", "0"))
+MY_USER_ID = int(os.getenv("MY_USER_ID", "0"))  # <-- ИСПРАВЛЕНО
+
+MEXC_API_KEY = os.getenv("MEXC_API_KEY", "")
+MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "")
 
 # ← ИЗМЕНЕНО: теперь только монеты с объёмом ≤ 1 000 000 USDT в сутки
 DAILY_VOLUME_LIMIT = 1_000_000
@@ -169,6 +174,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен")
+
 
 
 
