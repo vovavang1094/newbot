@@ -316,7 +316,7 @@ async def check_symbol_conditions(symbol: str) -> bool:
         
         # 6. Пробуем получить рыночную капитализацию
         market_cap = await get_market_cap(symbol)
-        MAX_MARKET_CAP = 80_000  # USDT
+        MAX_MARKET_CAP = 80_000_000  # USDT
         
         if market_cap > MAX_MARKET_CAP and market_cap > 0:
             logger.debug(f"Пропускаем {symbol}: капитализация {market_cap:,.0f} > {MAX_MARKET_CAP:,}")
@@ -1044,6 +1044,7 @@ if __name__ == "__main__":
         port=port,
         reload=False
     )
+
 
 
 
