@@ -17,7 +17,7 @@ import threading
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-MY_USER_ID = int(os.getenv("MY_USER_ID"))
+ALLOWED_USER_ID = int(os.getenv("MY_USER_ID"))
 
 MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY")
@@ -202,5 +202,6 @@ if __name__ == "__main__":
 
     print("Бот запущен! Напиши /start боту в личку.")
     asyncio.run(main())
+
 
 
