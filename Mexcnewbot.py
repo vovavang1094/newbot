@@ -11,7 +11,7 @@ import threading
 
 # ====================== НАСТРОЙКИ ======================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-MY_USER_ID = int(os.getenv("MY_USER_ID"))
+MY_USER_ID = int(os.getenv("MY_USER_ID", "0"))
 
 # ← ИЗМЕНЕНО: теперь только монеты с объёмом ≤ 1 000 000 USDT в сутки
 DAILY_VOLUME_LIMIT = 1_000_000
@@ -169,6 +169,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен")
+
 
 
 
