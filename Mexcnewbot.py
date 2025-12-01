@@ -28,7 +28,9 @@ MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY")
 
 DAILY_VOLUME_LIMIT = 500_000
 MIN_PREV_VOLUME = 1000
-MIN_CURRENT_VOLUME = 2500
+MIN_CURRENT_VOLUME = 2300
+MIN_PRICE = 0.0001  # Минимальная цена
+MAX_PRICE = 100.0     # Максимальная цена
 
 logging.basicConfig(
     level=logging.INFO,
@@ -221,68 +223,6 @@ def filter_stock_symbols(symbols: list) -> list:
     logger.info(f"После фильтрации акций: {len(filtered)} из {len(symbols)}")
     return filtered
 
-async def get_market_cap_coingecko(symbol: str) -> float:
-    """Получаем рыночную капитализацию через CoinGecko API"""
-    try:
-        clean_symbol = symbol.replace("USDT", "").lower()
-        
-        async with aiohttp.ClientSession() as session:
-            # Сначала ищем ID монеты
-            async with session.get(
-                f"https://api.coingecko.com/api/v3/search?query={clean_symbol}",
-                timeout=10
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    
-                    if data.get("coins") and len(data["coins"]) > 0:
-                        # Берем первую найденную монету
-                        coin_id = data["coins"][0]["id"]
-                        
-                        # Получаем детальную информацию
-                        async with session.get(
-                            f"https://api.coingecko.com/api/v3/coins/{coin_id}",
-                            timeout=10
-                        ) as detail_response:
-                            if detail_response.status == 200:
-                                coin_data = await detail_response.json()
-                                market_cap = coin_data.get("market_data", {}).get("market_cap", {}).get("usd", 0)
-                                return float(market_cap)
-        
-        return 0
-    except Exception as e:
-        logger.debug(f"Ошибка получения кап из CoinGecko для {symbol}: {e}")
-        return 0
-
-async def check_symbol_conditions(symbol: str) -> bool:
-    """Проверяем условия для символа"""
-    try:
-        # 1. Проверяем блэк-лист
-        if symbol in blacklist:
-            logger.debug(f"Пропускаем {symbol}: в блэк-листе")
-            return False
-        
-        # 2. Проверяем что это не акция
-        clean_symbol = symbol.replace("USDT", "")
-        if clean_symbol in STOCK_SYMBOLS:
-            logger.debug(f"Пропускаем акцию: {symbol}")
-            return False
-        
-        # 3. Проверяем что нет ключевых слов акций
-        if any(keyword in symbol.upper() for keyword in STOCK_KEYWORDS):
-            logger.debug(f"Пропускаем символ с ключевым словом: {symbol}")
-            return False
-        
-        # 4. Проверяем что нет цифр в символе
-        if any(char.isdigit() for char in clean_symbol):
-            logger.debug(f"Пропускаем символ с цифрами: {symbol}")
-            continue
-        
-        filtered.append(symbol)
-    
-    logger.info(f"После фильтрации акций: {len(filtered)} из {len(symbols)}")
-    return filtered
-
 
 async def check_symbol_conditions(symbol: str) -> bool:
     """Проверяем условия для символа"""
@@ -314,15 +254,24 @@ async def check_symbol_conditions(symbol: str) -> bool:
             logger.debug(f"Пропускаем {symbol}: объём {daily_volume:,.0f} > {DAILY_VOLUME_LIMIT:,}")
             return False
         
-        # 6. Пробуем получить рыночную капитализацию
-        market_cap = await get_market_cap(symbol)
-        MAX_MARKET_CAP = 80_000_000  # USDT
-        
-        if market_cap > MAX_MARKET_CAP and market_cap > 0:
-            logger.debug(f"Пропускаем {symbol}: капитализация {market_cap:,.0f} > {MAX_MARKET_CAP:,}")
+        # 6. Проверяем цену токена (фильтр вместо рыночной кап)
+        try:
+            data = await get_1m_kline_data(symbol)
+            if data:
+                current_price = data["curr_price"]
+                
+                # Фильтр по цене
+                if current_price < MIN_PRICE:
+                    logger.debug(f"Пропускаем {symbol}: цена слишком низкая {current_price:.8f}")
+                    return False
+                elif current_price > MAX_PRICE:
+                    logger.debug(f"Пропускаем {symbol}: цена слишком высокая {current_price:.4f}")
+                    return False
+        except Exception as e:
+            logger.debug(f"Ошибка проверки цены для {symbol}: {e}")
             return False
         
-        logger.debug(f"✓ {symbol}: объём {daily_volume:,.0f}, кап {market_cap:,.0f}")
+        logger.debug(f"✓ {symbol}: объём {daily_volume:,.0f}")
         return True
         
     except Exception as e:
@@ -398,6 +347,7 @@ async def load_and_filter_symbols():
                          f"<b>Уведомления отключены:</b> {len(paused_alerts)} монет\n\n"
                          f"<b>Фильтры:</b>\n"
                          f"• 1D объём < {DAILY_VOLUME_LIMIT:,} USDT\n"
+                         f"• Цена: {MIN_PRICE:.4f} - {MAX_PRICE:.2f} USDT\n"
                          f"• Исключены акции\n\n"
                          f"<b>Примеры:</b>\n{', '.join(sample[:8])}",
                     parse_mode="HTML"
@@ -663,6 +613,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>Отслеживаемых пар:</b> {len(tracked_symbols)}\n"
         f"<b>В блэк-листе:</b> {len(blacklist)} монет\n"
         f"<b>Уведомления отключены:</b> {len(paused_alerts)} монет\n\n"
+        f"<b>Фильтры:</b>\n"
+        f"• 1D объём < {DAILY_VOLUME_LIMIT:,} USDT\n"
+        f"• Цена: {MIN_PRICE:.4f} - {MAX_PRICE:.2f} USDT\n\n"
         f"<i>Выберите действие:</i>",
         parse_mode="HTML",
         reply_markup=reply_markup
@@ -727,6 +680,9 @@ async def start_callback(query):
         f"<b>Отслеживаемых пар:</b> {len(tracked_symbols)}\n"
         f"<b>В блэк-листе:</b> {len(blacklist)} монет\n"
         f"<b>Уведомления отключены:</b> {len(paused_alerts)} монет\n\n"
+        f"<b>Фильтры:</b>\n"
+        f"• 1D объём < {DAILY_VOLUME_LIMIT:,} USDT\n"
+        f"• Цена: {MIN_PRICE:.4f} - {MAX_PRICE:.2f} USDT\n\n"
         f"<i>Выберите действие:</i>",
         parse_mode="HTML",
         reply_markup=reply_markup
@@ -1027,6 +983,11 @@ async def root():
         "tracked_pairs": len(tracked_symbols),
         "blacklist_count": len(blacklist),
         "paused_count": len(paused_alerts),
+        "filters": {
+            "daily_volume_limit": DAILY_VOLUME_LIMIT,
+            "min_price": MIN_PRICE,
+            "max_price": MAX_PRICE
+        },
         "recent_alerts": len([v for v in sent_alerts.values() if time.time() - v < 7200])
     }
 
@@ -1044,6 +1005,7 @@ if __name__ == "__main__":
         port=port,
         reload=False
     )
+
 
 
 
