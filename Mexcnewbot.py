@@ -698,17 +698,21 @@ async def start_callback(query):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await query.edit_message_text(
-        f"<b>📊 MEXC Volume Scanner</b>\n\n"
-        f"<b>Статус:</b> ✅ Активен\n"
-        f"<b>Отслеживаемых пар:</b> {len(tracked_symbols)}\n"
-        f"<b>В блэк-листе:</b> {len(blacklist)} монет\n"
-        f"<b>Уведомления отключены:</b> {len(paused_alerts)} монет\n\n"
-        f"<b>Фильтры:</b>\n"
+    # Упрощенный текст без потенциально проблемных HTML тегов
+    text = (
+        "📊 MEXC Volume Scanner\n\n"
+        f"Статус: ✅ Активен\n"
+        f"Отслеживаемых пар: {len(tracked_symbols)}\n"
+        f"В блэк-листе: {len(blacklist)} монет\n"
+        f"Уведомления отключены: {len(paused_alerts)} монет\n\n"
+        f"Фильтры:\n"
         f"• 1D объём < {DAILY_VOLUME_LIMIT:,} USDT\n"
         f"• Цена: {MIN_PRICE:.4f} - {MAX_PRICE:.2f} USDT\n\n"
-        f"<i>Выберите действие:</i>",
-        parse_mode="HTML",
+        f"Выберите действие:"
+    )
+    
+    await query.edit_message_text(
+        text,
         reply_markup=reply_markup
     )
 
@@ -979,6 +983,7 @@ if __name__ == "__main__":
         port=port,
         reload=False
     )
+
 
 
 
