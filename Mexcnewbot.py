@@ -284,7 +284,7 @@ async def volume_spike_scanner():
                 parse_mode="HTML"
             )
         except:
-        pass
+            pass
     
     iteration = 0
     
@@ -570,6 +570,7 @@ if __name__ == "__main__":
         port=port,
         reload=False
     )
+
 
 
 
