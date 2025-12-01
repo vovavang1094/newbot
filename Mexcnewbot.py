@@ -12,10 +12,7 @@ from telegram.ext import Application, ContextTypes, CommandHandler, CallbackQuer
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 import uvicorn
-from datetime import datetime
-
-# Импортируем базу данных
-from database_simple import db
+from datetime import datetime, timedelta
 
 # ====================== НАСТРОЙКИ ======================
 load_dotenv()
@@ -23,14 +20,25 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 MY_USER_ID = int(os.getenv("MY_USER_ID", 0))
 
-MEXC_API_KEY = os.getenv("MEXC_API_KEY")
-MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY")
+# ПРОВЕРКА ОБЯЗАТЕЛЬНЫХ ПЕРЕМЕННЫХ
+if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "ваш_токен_бота":
+    print("❌ ОШИБКА: TELEGRAM_TOKEN не установлен!")
+    print("Пожалуйста, установите переменную окружения TELEGRAM_TOKEN на Render")
+    exit(1)
+
+if not MY_USER_ID:
+    print("❌ ОШИБКА: MY_USER_ID не установлен!")
+    print("Пожалуйста, установите переменную окружения MY_USER_ID на Render")
+    exit(1)
+
+MEXC_API_KEY = os.getenv("MEXC_API_KEY", "")
+MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "")
 
 DAILY_VOLUME_LIMIT = 500_000
 MIN_PREV_VOLUME = 1000
-MIN_CURRENT_VOLUME = 2300
-MIN_PRICE = 0.0001  # Минимальная цена
-MAX_PRICE = 100.0     # Максимальная цена
+MIN_CURRENT_VOLUME = 2200
+MIN_PRICE = 0.0001
+MAX_PRICE = 100
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +51,7 @@ tracked_symbols = set()
 sent_alerts = {}
 blacklist = set()
 paused_alerts = set()
+alert_history = []
 
 # Глобальные переменные для управления задачами
 scanner_task = None
@@ -254,7 +263,7 @@ async def check_symbol_conditions(symbol: str) -> bool:
             logger.debug(f"Пропускаем {symbol}: объём {daily_volume:,.0f} > {DAILY_VOLUME_LIMIT:,}")
             return False
         
-        # 6. Проверяем цену токена (фильтр вместо рыночной кап)
+        # 6. Проверяем цену токена
         try:
             data = await get_1m_kline_data(symbol)
             if data:
@@ -362,19 +371,38 @@ async def load_and_filter_symbols():
         return False
 
 
-# ====================== ОБНОВЛЕННЫЕ ФУНКЦИИ УПРАВЛЕНИЯ ======================
+# ====================== ФУНКЦИИ УПРАВЛЕНИЯ ДАННЫМИ ======================
 async def load_data_from_db():
-    """Загружаем данные из базы"""
-    global blacklist, paused_alerts
-    
-    try:
-        blacklist = await db.get_blacklist()
-        paused_alerts = await db.get_paused_alerts()
-        logger.info(f"Загружено из БД: blacklist={len(blacklist)}, paused={len(paused_alerts)}")
-    except Exception as e:
-        logger.error(f"Ошибка загрузки из БД: {e}")
-        blacklist = set()
-        paused_alerts = set()
+    """Загружаем данные (упрощенная версия в памяти)"""
+    global blacklist, paused_alerts, alert_history
+    logger.info("Данные загружены из памяти")
+    return True
+
+
+async def save_alert_to_history(symbol: str, prev_volume: int, curr_volume: int, 
+                               prev_price: float, curr_price: float, 
+                               volume_change_pct: float, price_change_pct: float):
+    """Сохраняем алерт в историю"""
+    alert = {
+        'symbol': symbol,
+        'prev_volume': prev_volume,
+        'curr_volume': curr_volume,
+        'prev_price': prev_price,
+        'curr_price': curr_price,
+        'volume_change_pct': volume_change_pct,
+        'price_change_pct': price_change_pct,
+        'created_at': datetime.now()
+    }
+    alert_history.append(alert)
+    # Храним только последние 1000 алертов
+    if len(alert_history) > 1000:
+        alert_history = alert_history[-1000:]
+
+
+def get_recent_alerts(hours: int = 24):
+    """Получить недавние алерты"""
+    cutoff_time = datetime.now() - timedelta(hours=hours)
+    return [alert for alert in alert_history if alert['created_at'] > cutoff_time]
 
 
 async def toggle_pause_symbol(query, symbol: str):
@@ -382,11 +410,9 @@ async def toggle_pause_symbol(query, symbol: str):
     try:
         if symbol in paused_alerts:
             paused_alerts.remove(symbol)
-            await db.remove_paused_alert(symbol)
             action = "включены"
         else:
             paused_alerts.add(symbol)
-            await db.add_paused_alert(symbol)
             action = "отключены"
         
         await query.edit_message_text(
@@ -412,7 +438,6 @@ async def add_to_blacklist(query, symbol: str):
             return
         
         blacklist.add(symbol)
-        await db.add_to_blacklist(symbol)
         
         # Удаляем из отслеживаемых
         if symbol in tracked_symbols:
@@ -421,7 +446,6 @@ async def add_to_blacklist(query, symbol: str):
         # Удаляем из пауз
         if symbol in paused_alerts:
             paused_alerts.remove(symbol)
-            await db.remove_paused_alert(symbol)
         
         keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -451,7 +475,6 @@ async def remove_from_blacklist(query, symbol: str):
             return
         
         blacklist.remove(symbol)
-        await db.remove_from_blacklist(symbol)
         
         await query.edit_message_text(
             f"✅ <b>{symbol}</b> удален из блэк-листа\n\n"
@@ -466,7 +489,7 @@ async def remove_from_blacklist(query, symbol: str):
         )
 
 
-# ====================== ОБНОВЛЕННЫЙ СКАНЕР ======================
+# ====================== СКАНЕР ======================
 async def volume_spike_scanner():
     """Сканируем все низковольюмные пары на всплески объёма на 1m"""
     logger.info(f"🚀 Сканер запущен! Отслеживаю {len(tracked_symbols)} пар")
@@ -530,15 +553,12 @@ async def volume_spike_scanner():
                         if volume_change_pct < 50:
                             continue
                         
-                        # Сохраняем алерт в базу
-                        try:
-                            await db.save_alert(
-                                symbol, prev_vol, curr_vol, 
-                                prev_price, curr_price,
-                                volume_change_pct, price_change_pct
-                            )
-                        except Exception as e:
-                            logger.error(f"Ошибка сохранения алерта в БД: {e}")
+                        # Сохраняем алерт в историю
+                        await save_alert_to_history(
+                            symbol, prev_vol, curr_vol, 
+                            prev_price, curr_price,
+                            volume_change_pct, price_change_pct
+                        )
                         
                         # Создаем клавиатуру
                         keyboard = [
@@ -793,7 +813,7 @@ async def refresh_symbols(query):
 async def stats_db_query(query):
     """Статистика через callback"""
     try:
-        recent_alerts = await db.get_recent_alerts(24)
+        recent_alerts = get_recent_alerts(24)
         
         alert_count = len(recent_alerts)
         unique_symbols = len(set([alert['symbol'] for alert in recent_alerts]))
@@ -827,84 +847,30 @@ async def stats_db_query(query):
         await query.edit_message_text("❌ Ошибка получения статистики")
 
 
-# ====================== НОВЫЕ КОМАНДЫ ======================
-async def stats_db(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Расширенная статистика из базы данных"""
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда статистики"""
     if update.effective_user.id != MY_USER_ID:
         return
     
     try:
-        recent_alerts = await db.get_recent_alerts(24)
+        recent_alerts = get_recent_alerts(24)
         
         alert_count = len(recent_alerts)
         unique_symbols = len(set([alert['symbol'] for alert in recent_alerts]))
         
-        # Находим самые активные монеты
-        symbol_counts = {}
-        for alert in recent_alerts:
-            symbol = alert['symbol']
-            symbol_counts[symbol] = symbol_counts.get(symbol, 0) + 1
-        
-        top_symbols = sorted(symbol_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-        
         stats_text = f"<b>📊 Статистика за 24ч</b>\n\n"
         stats_text += f"<b>Всего алертов:</b> {alert_count}\n"
         stats_text += f"<b>Уникальных пар:</b> {unique_symbols}\n"
+        stats_text += f"<b>Отслеживаемых пар:</b> {len(tracked_symbols)}\n"
         stats_text += f"<b>В блэк-листе:</b> {len(blacklist)}\n"
         stats_text += f"<b>Пауз уведомлений:</b> {len(paused_alerts)}\n\n"
-        
-        if top_symbols:
-            stats_text += "<b>Топ-5 активных пар:</b>\n"
-            for symbol, count in top_symbols:
-                stats_text += f"• {symbol}: {count} алертов\n"
+        stats_text += f"<b>Время:</b> {datetime.now().strftime('%H:%M:%S')}"
         
         await update.message.reply_text(stats_text, parse_mode="HTML")
         
     except Exception as e:
         logger.error(f"Ошибка получения статистики: {e}")
         await update.message.reply_text("❌ Ошибка получения статистики")
-
-
-async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """История алертов для конкретной монеты"""
-    if update.effective_user.id != MY_USER_ID:
-        return
-    
-    if not context.args:
-        await update.message.reply_text(
-            "Использование: /history <символ>\n"
-            "Пример: /history BTCUSDT"
-        )
-        return
-    
-    symbol = context.args[0].upper()
-    if not symbol.endswith("USDT"):
-        symbol += "USDT"
-    
-    try:
-        all_alerts = await db.get_recent_alerts(24)
-        symbol_alerts = [a for a in all_alerts if a['symbol'] == symbol][:10]
-        
-        if not symbol_alerts:
-            await update.message.reply_text(f"ℹ️ За последние 24 часа не было алертов для {symbol}")
-            return
-        
-        history_text = f"<b>📈 История алертов: {symbol}</b>\n\n"
-        
-        for i, alert in enumerate(symbol_alerts, 1):
-            time_str = alert['created_at'].strftime("%H:%M")
-            history_text += (
-                f"{i}. <b>{time_str}</b>\n"
-                f"   Объём: {alert['prev_volume']:,}→{alert['curr_volume']:,} "
-                f"(<b>{alert['volume_change_pct']:+.0f}%</b>)\n"
-                f"   Цена: <b>{alert['price_change_pct']:+.2f}%</b>\n\n"
-            )
-        
-        await update.message.reply_text(history_text, parse_mode="HTML")
-        
-    except Exception as e:
-        logger.error(f"Ошибка получения истории: {e}")
-        await update.message.reply_text("❌ Ошибка получения истории")
 
 
 async def run_telegram_polling():
@@ -918,39 +884,51 @@ async def run_telegram_polling():
         logger.error(f"Ошибка запуска Telegram бота: {e}")
 
 
-# ====================== ОБНОВЛЕННЫЙ ЗАПУСК ======================
+# ====================== ЗАПУСК ======================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global scanner_task, application, bot_instance
     
-    logger.info("=== Запуск MEXC Volume Scanner с PostgreSQL ===")
+    logger.info("=== Запуск MEXC Volume Scanner ===")
     
-    # Подключаемся к базе данных
+    # Проверка токена
+    logger.info(f"TELEGRAM_TOKEN: {'*' * len(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else 'НЕ УСТАНОВЛЕН'}")
+    logger.info(f"MY_USER_ID: {MY_USER_ID}")
+    
+    if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "ваш_токен_бота":
+        logger.error("❌ TELEGRAM_TOKEN не установлен!")
+        raise ValueError("TELEGRAM_TOKEN не установлен")
+    
+    if not MY_USER_ID:
+        logger.error("❌ MY_USER_ID не установлен!")
+        raise ValueError("MY_USER_ID не установлен")
+    
+    # Создаем экземпляр бота
     try:
-        await db.connect()
-        logger.info("✅ Подключение к базе данных установлено")
+        bot_instance = Bot(token=TELEGRAM_TOKEN)
+        logger.info("✅ Telegram бот создан успешно")
     except Exception as e:
-        logger.error(f"❌ Ошибка подключения к базе данных: {e}")
-        # Можно продолжить без базы данных, но с ограничениями
+        logger.error(f"❌ Ошибка создания бота: {e}")
+        raise
     
-    # Загружаем данные из базы
+    # Загружаем данные
     await load_data_from_db()
     
-    bot_instance = Bot(token=TELEGRAM_TOKEN)
-    
+    # Инициализируем Telegram приложение
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("stats", stats_db))
-    application.add_handler(CommandHandler("history", history_command))
+    application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     
+    # Загружаем и фильтруем символы
     await load_and_filter_symbols()
     
+    # Запускаем сканер
     scanner_task = asyncio.create_task(volume_spike_scanner())
-    logger.info("Сканер запущен в фоне")
+    logger.info("✅ Сканер запущен")
     
-    if TELEGRAM_TOKEN and MY_USER_ID:
-        asyncio.create_task(run_telegram_polling())
+    # Запускаем Telegram polling
+    asyncio.create_task(run_telegram_polling())
     
     yield
     
@@ -963,9 +941,6 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
     
-    # Закрываем соединение с базой
-    await db.close()
-    
     if application:
         await application.shutdown()
         await application.stop()
@@ -977,17 +952,12 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/")
 async def root():
     return {
-        "service": "MEXC Volume Scanner с PostgreSQL",
+        "service": "MEXC Volume Scanner",
         "status": "active",
         "timestamp": datetime.now().isoformat(),
         "tracked_pairs": len(tracked_symbols),
         "blacklist_count": len(blacklist),
         "paused_count": len(paused_alerts),
-        "filters": {
-            "daily_volume_limit": DAILY_VOLUME_LIMIT,
-            "min_price": MIN_PRICE,
-            "max_price": MAX_PRICE
-        },
         "recent_alerts": len([v for v in sent_alerts.values() if time.time() - v < 7200])
     }
 
@@ -1005,6 +975,7 @@ if __name__ == "__main__":
         port=port,
         reload=False
     )
+
 
 
 
