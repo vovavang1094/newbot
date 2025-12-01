@@ -16,7 +16,7 @@ import threading
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID"))
+MY_USER_ID = int(os.getenv("MY_USER_ID"))
 MEXC_API_KEY = os.getenv("MEXC_API_KEY", "")
 MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY", "")
 
@@ -178,6 +178,7 @@ if __name__ == "__main__":
         await application.run_polling(drop_pending_updates=True)
 
     asyncio.run(main())
+
 
 
 
