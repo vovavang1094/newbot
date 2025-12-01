@@ -1,4 +1,3 @@
-python
 import os
 import asyncpg
 from datetime import datetime
