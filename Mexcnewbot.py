@@ -11,8 +11,7 @@ from telegram.ext import Application, ContextTypes, CommandHandler
 from fastapi import FastAPI
 from contextlib import asynccontextmanager
 import uvicorn
-from datetime import datetime
-import json
+from datetime import datetime, timedelta
 
 # ====================== НАСТРОЙКИ ======================
 load_dotenv()
@@ -24,8 +23,8 @@ MEXC_API_KEY = os.getenv("MEXC_API_KEY")
 MEXC_SECRET_KEY = os.getenv("MEXC_SECRET_KEY")
 
 DAILY_VOLUME_LIMIT = 2_000_000  # USDT — максимальный дневной объём
-MIN_PREV_VOLUME = 1000  # Минимальный предыдущий объём
-MIN_CURRENT_VOLUME = 2000  # Минимальный текущий объём для алерта
+MIN_PREV_VOLUME = 1000  # Минимальный предыдущий объём на 1m
+MIN_CURRENT_VOLUME = 2000  # Минимальный текущий объём для алерта на 1m
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,95 +33,102 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Глобальные переменные
-tracked_symbols = set()
-sent_alerts = {}
+tracked_symbols = set()  # Все символы с 1D объёмом < 2M USDT
+sent_alerts = {}  # Для предотвращения дублирования алертов
 
 # Глобальные переменные для управления задачами
 scanner_task = None
 application = None
 bot_instance = None
 
-# ====================== MEXC API ======================
-async def load_low_volume_symbols():
-    """Загружаем ВСЕ символы фьючерсов и фильтруем по дневному объёму < 2M USDT"""
-    global tracked_symbols
-    
+# ====================== MEXC API ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ======================
+def generate_signature(params: str) -> str:
+    """Генерация подписи для MEXC API"""
+    return hmac.new(
+        MEXC_SECRET_KEY.encode() if MEXC_SECRET_KEY else b"",
+        params.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+
+async def get_all_futures_symbols():
+    """Получаем ВСЕ символы фьючерсов с MEXC"""
     try:
-        logger.info("Запрашиваю данные о фьючерсах с MEXC API...")
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                "https://contract.mexc.com/api/v1/contract/detail", 
-                timeout=20
+                "https://contract.mexc.com/api/v1/contract/detail",
+                timeout=15
             ) as resp:
-                logger.info(f"Статус ответа: {resp.status}")
-                
                 if resp.status != 200:
-                    logger.error(f"API вернул ошибку: {resp.status}")
-                    return False
+                    logger.error(f"Ошибка получения символов: {resp.status}")
+                    return []
                 
                 data = await resp.json()
-                logger.info(f"Получены данные от API, успех: {data.get('success')}")
-                
-                # Сохраняем ответ для отладки
-                with open("mexc_debug.json", "w") as f:
-                    json.dump(data, f, indent=2)
-                logger.info("Ответ API сохранён в mexc_debug.json")
-                
                 if not data.get("success"):
-                    logger.error(f"API не success: {data.get('code', 'N/A')} - {data.get('msg', 'N/A')}")
-                    return False
-
+                    logger.error(f"API error: {data}")
+                    return []
+                
                 symbols_data = data.get("data", [])
-                logger.info(f"Получено {len(symbols_data)} символов")
-                
-                new_tracked = set()
-                low_volume_count = 0
-                
-                for idx, s in enumerate(symbols_data[:10]):  # Логируем первые 10 для отладки
-                    symbol_name = s.get("symbol", "")
-                    state = s.get("state", 0)
-                    volume24h = float(s.get("volume24h", 0))
-                    
-                    if idx < 5:  # Логируем первые 5 для понимания структуры
-                        logger.info(f"Символ {idx}: {symbol_name}, state: {state}, volume24h: {volume24h:,.0f}")
+                all_symbols = []
                 
                 for s in symbols_data:
                     symbol_name = s.get("symbol", "")
-                    state = s.get("state", 0)
-                    volume24h = float(s.get("volume24h", 0))
-                    
-                    # Проверяем что это USDT фьючерс и активен
-                    if symbol_name.endswith("_USDT") and state == 1:
-                        if volume24h <= DAILY_VOLUME_LIMIT:
-                            # Преобразуем формат: BTC_USDT -> BTCUSDT
-                            formatted_symbol = symbol_name.replace("_USDT", "USDT")
-                            new_tracked.add(formatted_symbol)
-                            low_volume_count += 1
-                    
-                tracked_symbols = new_tracked
-                logger.info(f"Найдено пар с объёмом ≤ {DAILY_VOLUME_LIMIT:,}: {low_volume_count}")
-                logger.info(f"Всего активных USDT пар: {len([s for s in symbols_data if s.get('symbol', '').endswith('_USDT') and s.get('state') == 1])}")
+                    if symbol_name.endswith("_USDT"):
+                        # Форматируем: BTC_USDT -> BTCUSDT
+                        formatted = symbol_name.replace("_USDT", "USDT")
+                        all_symbols.append(formatted)
                 
-                # Если всё равно 0, пробуем альтернативный подход
-                if len(tracked_symbols) == 0:
-                    logger.warning("Нет пар с объёмом < 2M. Пробую альтернативный подход...")
-                    
-                    # Альтернатива 1: берем все активные пары
-                    for s in symbols_data:
-                        symbol_name = s.get("symbol", "")
-                        state = s.get("state", 0)
-                        
-                        if symbol_name.endswith("_USDT") and state == 1:
-                            formatted_symbol = symbol_name.replace("_USDT", "USDT")
-                            tracked_symbols.add(formatted_symbol)
-                    
-                    logger.info(f"Альтернатива: отслеживаю ВСЕ активные пары: {len(tracked_symbols)}")
-                
-                return True
+                logger.info(f"Найдено {len(all_symbols)} USDT фьючерсов")
+                return all_symbols
                 
     except Exception as e:
-        logger.error(f"Ошибка загрузки символов: {e}", exc_info=True)
-        return False
+        logger.error(f"Ошибка получения всех символов: {e}")
+        return []
+
+
+async def get_1d_volume(symbol: str) -> float:
+    """Получаем объём за 1 день (24 часа) для символа"""
+    api_symbol = symbol.replace("USDT", "_USDT")
+    timestamp = str(int(time.time() * 1000))
+    
+    # Получаем данные за 1 день (последнюю свечу)
+    query_string = f"symbol={api_symbol}&interval=Day1&limit=1"
+    signature = generate_signature(query_string)
+    
+    headers = {
+        "ApiKey": MEXC_API_KEY if MEXC_API_KEY else "",
+        "Request-Time": timestamp,
+        "Signature": signature
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://contract.mexc.com/api/v1/contract/kline/{api_symbol}",
+                params={
+                    "symbol": api_symbol,
+                    "interval": "Day1",  # Дневной таймфрейм
+                    "limit": 1  # Только последняя свеча
+                },
+                headers=headers,
+                timeout=10
+            ) as response:
+                
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("success") and "data" in data:
+                        kline_data = data["data"]
+                        if "amount" in kline_data and len(kline_data["amount"]) > 0:
+                            volume = float(kline_data["amount"][0])
+                            logger.debug(f"{symbol}: 1D объём = {volume:,.0f} USDT")
+                            return volume
+                
+                logger.debug(f"Не удалось получить 1D объём для {symbol}")
+                return 0
+                
+    except Exception as e:
+        logger.debug(f"Ошибка получения 1D объёма для {symbol}: {str(e)[:100]}")
+        return 0
 
 
 async def get_1m_kline_data(symbol: str):
@@ -130,20 +136,15 @@ async def get_1m_kline_data(symbol: str):
     api_symbol = symbol.replace("USDT", "_USDT")
     timestamp = str(int(time.time() * 1000))
     
-    # Создаем подпись для API
     query_string = f"symbol={api_symbol}&interval=Min1&limit=2"
-    signature = hmac.new(
-        MEXC_SECRET_KEY.encode() if MEXC_SECRET_KEY else b"",
-        query_string.encode(), 
-        hashlib.sha256
-    ).hexdigest()
+    signature = generate_signature(query_string)
     
     headers = {
         "ApiKey": MEXC_API_KEY if MEXC_API_KEY else "",
         "Request-Time": timestamp,
         "Signature": signature
     }
-
+    
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -156,18 +157,15 @@ async def get_1m_kline_data(symbol: str):
                 headers=headers,
                 timeout=10
             ) as response:
+                
                 if response.status == 200:
                     data = await response.json()
                     if data.get("success") and "data" in data:
                         kline_data = data["data"]
                         
-                        # Проверяем что есть данные
                         if len(kline_data.get("close", [])) >= 2:
-                            # Предыдущая свеча (индекс 0)
                             prev_volume = int(float(kline_data["amount"][0]))
                             prev_close = float(kline_data["close"][0])
-                            
-                            # Текущая свеча (индекс 1)
                             curr_volume = int(float(kline_data["amount"][1]))
                             curr_close = float(kline_data["close"][1])
                             
@@ -178,32 +176,84 @@ async def get_1m_kline_data(symbol: str):
                                 "curr_price": curr_close,
                                 "symbol": symbol
                             }
-                        else:
-                            logger.debug(f"Недостаточно данных для {symbol}")
-                else:
-                    logger.debug(f"Ошибка API для {symbol}: {response.status}")
-                        
-    except asyncio.TimeoutError:
-        logger.debug(f"Таймаут при получении данных для {symbol}")
+                
     except Exception as e:
-        logger.debug(f"Ошибка получения данных для {symbol}: {str(e)[:100]}")
+        logger.debug(f"Ошибка 1m данных для {symbol}: {str(e)[:100]}")
     
     return None
 
 
-# ====================== СКАНЕР ВСПЛЕСКОВ ОБЪЁМА ======================
-async def scan_all_low_volume_pairs():
-    """Сканируем ВСЕ низковольюмные пары на всплески объёма"""
-    logger.info(f"Сканер запущен. Отслеживается {len(tracked_symbols)} пар.")
+# ====================== ЗАГРУЗКА И ФИЛЬТРАЦИЯ СИМВОЛОВ ======================
+async def load_and_filter_symbols():
+    """Загружаем ВСЕ символы и фильтруем по 1D объёму < 2M USDT"""
+    global tracked_symbols
     
-    # Если нет пар для отслеживания, сообщаем в Telegram
+    logger.info("Начинаю загрузку и фильтрацию символов...")
+    
+    try:
+        # 1. Получаем ВСЕ символы фьючерсов
+        all_symbols = await get_all_futures_symbols()
+        if not all_symbols:
+            logger.error("Не удалось получить символы фьючерсов")
+            return False
+        
+        logger.info(f"Получено {len(all_symbols)} символов. Начинаю проверку 1D объёма...")
+        
+        # 2. Проверяем 1D объём для каждого символа
+        low_volume_symbols = []
+        
+        # Ограничиваем количество для первой проверки
+        max_initial_check = 100  # Проверяем первые 100 для скорости
+        symbols_to_check = all_symbols[:max_initial_check]
+        
+        for symbol in symbols_to_check:
+            try:
+                daily_volume = await get_1d_volume(symbol)
+                
+                if daily_volume <= DAILY_VOLUME_LIMIT:
+                    low_volume_symbols.append(symbol)
+                    logger.debug(f"✓ {symbol}: {daily_volume:,.0f} USDT (добавлен)")
+                else:
+                    logger.debug(f"✗ {symbol}: {daily_volume:,.0f} USDT (пропущен)")
+                
+                # Небольшая задержка чтобы не превысить лимиты API
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                logger.error(f"Ошибка проверки {symbol}: {e}")
+                continue
+        
+        tracked_symbols = set(low_volume_symbols)
+        
+        logger.info(f"✅ Загрузка завершена!")
+        logger.info(f"   Всего символов: {len(all_symbols)}")
+        logger.info(f"   Проверено: {len(symbols_to_check)}")
+        logger.info(f"   Отслеживается: {len(tracked_symbols)} (1D объём < {DAILY_VOLUME_LIMIT:,} USDT)")
+        
+        if tracked_symbols:
+            sample = list(tracked_symbols)[:10]
+            logger.info(f"   Примеры: {sample}")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Критическая ошибка при загрузке символов: {e}")
+        return False
+
+
+# ====================== СКАНЕР ВСПЛЕСКОВ ОБЪЁМА ======================
+async def volume_spike_scanner():
+    """Сканируем все низковольюмные пары на всплески объёма на 1m"""
+    logger.info(f"🚀 Сканер запущен! Отслеживаю {len(tracked_symbols)} пар")
+    
     if len(tracked_symbols) == 0:
+        logger.warning("Нет пар для отслеживания! Отправляю уведомление...")
         try:
             await bot_instance.send_message(
                 chat_id=MY_USER_ID,
                 text="⚠️ <b>ВНИМАНИЕ</b>\n\n"
-                     "Не найдено пар для отслеживания!\n"
-                     "Проверьте API ключи или параметры фильтрации.",
+                     "Сканер запущен, но не найдено пар для отслеживания!\n"
+                     "Проверьте настройки или API доступ.",
                 parse_mode="HTML"
             )
         except:
@@ -216,29 +266,25 @@ async def scan_all_low_volume_pairs():
             current_minute = datetime.now().strftime("%Y%m%d%H%M")
             iteration += 1
             
-            # Каждые 10 итераций логируем статус
-            if iteration % 10 == 1:
-                logger.info(f"Итерация {iteration}. Отслеживается {len(tracked_symbols)} пар. Активных алертов: {len(sent_alerts)}")
+            # Логируем статус каждые 10 минут
+            if iteration % 20 == 1:
+                logger.info(f"Итерация {iteration}. Отслеживается {len(tracked_symbols)} пар")
             
-            # Если нет пар для отслеживания, пытаемся обновить список
+            # Если нет пар, пробуем перезагрузить
             if len(tracked_symbols) == 0:
-                logger.warning("Нет пар для отслеживания. Пробую обновить...")
-                await load_low_volume_symbols()
-                await asyncio.sleep(10)
+                logger.warning("Нет пар для отслеживания. Перезагружаю...")
+                await load_and_filter_symbols()
+                await asyncio.sleep(30)
                 continue
             
-            # Для каждой отслеживаемой пары
-            symbols_to_check = list(tracked_symbols)
+            # Получаем список пар для проверки
+            symbols_list = list(tracked_symbols)
             
-            # Ограничиваем количество для проверки в одной итерации
-            max_check_per_iteration = 50
-            if len(symbols_to_check) > max_check_per_iteration:
-                # Берем случайную выборку
-                import random
-                symbols_to_check = random.sample(symbols_to_check, max_check_per_iteration)
-                logger.debug(f"Проверяю выборку из {len(symbols_to_check)} пар")
+            # Ограничиваем количество проверок за итерацию
+            max_per_iteration = min(50, len(symbols_list))
             
-            for symbol in symbols_to_check:
+            # Проверяем каждую пару
+            for symbol in symbols_list[:max_per_iteration]:
                 try:
                     data = await get_1m_kline_data(symbol)
                     if not data:
@@ -249,10 +295,6 @@ async def scan_all_low_volume_pairs():
                     prev_price = data["prev_price"]
                     curr_price = data["curr_price"]
                     
-                    # Пропускаем если данные некорректные
-                    if prev_vol <= 0 or curr_vol <= 0:
-                        continue
-                    
                     # Проверяем условие всплеска
                     if prev_vol < MIN_PREV_VOLUME and curr_vol > MIN_CURRENT_VOLUME:
                         alert_id = f"{symbol}_{current_minute}"
@@ -261,35 +303,22 @@ async def scan_all_low_volume_pairs():
                             continue
                         
                         # Рассчитываем изменения
-                        volume_change = curr_vol - prev_vol
-                        volume_change_pct = (volume_change / prev_vol) * 100
+                        volume_change_pct = ((curr_vol - prev_vol) / max(prev_vol, 1)) * 100
+                        price_change_pct = ((curr_price - prev_price) / max(prev_price, 0.00000001)) * 100
                         
-                        if prev_price > 0:
-                            price_change_pct = ((curr_price - prev_price) / prev_price) * 100
-                        else:
-                            price_change_pct = 0
-                        
-                        # Форматируем цену
-                        if curr_price >= 1:
-                            price_format = f"{curr_price:.4f}"
-                        elif curr_price >= 0.01:
-                            price_format = f"{curr_price:.6f}"
-                        else:
-                            price_format = f"{curr_price:.8f}"
-                        
-                        # Формируем сообщение
+                        # Форматируем сообщение
                         message = (
-                            f"<b>⚡ ВСПЛЕСК ОБЪЁМА</b>\n\n"
+                            f"<b>⚡ ВСПЛЕСК ОБЪЁМА 1M</b>\n\n"
                             f"<b>Пара:</b> {symbol}\n"
                             f"<b>Время:</b> {datetime.now().strftime('%H:%M:%S')}\n\n"
                             f"<b>Объём 1M:</b>\n"
-                            f"Предыдущий: {prev_vol:,} USDT\n"
-                            f"Текущий: <b>{curr_vol:,} USDT</b>\n"
-                            f"Изменение: <b>{volume_change_pct:+.0f}%</b>\n\n"
+                            f"• Предыдущий: {prev_vol:,} USDT\n"
+                            f"• Текущий: <b>{curr_vol:,} USDT</b>\n"
+                            f"• Изменение: <b>{volume_change_pct:+.0f}%</b>\n\n"
                             f"<b>Цена:</b>\n"
-                            f"Было: {prev_price:.8f}\n"
-                            f"Стало: <b>{price_format}</b>\n"
-                            f"Изменение: <b>{price_change_pct:+.2f}%</b>\n\n"
+                            f"• Было: {prev_price:.8f}\n"
+                            f"• Стало: <b>{curr_price:.8f}</b>\n"
+                            f"• Изменение: <b>{price_change_pct:+.2f}%</b>\n\n"
                             f"<a href='https://www.mexc.com/futures/{symbol[:-4]}_USDT'>📊 Открыть фьючерс</a>"
                         )
                         
@@ -303,25 +332,25 @@ async def scan_all_low_volume_pairs():
                             )
                             
                             sent_alerts[alert_id] = time.time()
-                            logger.info(f"АЛЕРТ: {symbol} | Объём: {prev_vol:,}→{curr_vol:,} (+{volume_change_pct:.0f}%)")
+                            logger.info(f"🚨 АЛЕРТ: {symbol} | {prev_vol:,}→{curr_vol:,} (+{volume_change_pct:.0f}%)")
                             
                         except Exception as e:
                             logger.error(f"Ошибка отправки: {e}")
                             
                 except Exception as e:
-                    logger.debug(f"Ошибка при обработке {symbol}: {str(e)[:100]}")
+                    logger.debug(f"Ошибка обработки {symbol}: {str(e)[:100]}")
                     continue
             
-            # Очищаем старые алерты
+            # Очищаем старые алерты (старше 1 часа)
             current_time = time.time()
-            expired_alerts = [k for k, v in sent_alerts.items() if current_time - v > 3600]
-            for expired in expired_alerts:
-                sent_alerts.pop(expired, None)
+            expired = [k for k, v in sent_alerts.items() if current_time - v > 3600]
+            for exp in expired:
+                sent_alerts.pop(exp, None)
             
-            # Обновляем список символов каждые 30 минут
-            if iteration % 30 == 0:  # Примерно каждые 30 минут
-                logger.info("Обновляю список символов...")
-                await load_low_volume_symbols()
+            # Обновляем список символов каждые 4 часа
+            if iteration % 480 == 0:  # 30 сек * 480 = 4 часа
+                logger.info("🔄 Обновляю список символов (каждые 4 часа)...")
+                await load_and_filter_symbols()
             
             # Ждем 30 секунд до следующей проверки
             await asyncio.sleep(30)
@@ -330,7 +359,7 @@ async def scan_all_low_volume_pairs():
             logger.info("Сканер остановлен")
             break
         except Exception as e:
-            logger.error(f"Ошибка в сканере: {e}")
+            logger.error(f"Критическая ошибка в сканере: {e}")
             await asyncio.sleep(60)
 
 
@@ -345,34 +374,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>📊 MEXC Volume Scanner</b>\n\n"
         f"<b>Статус:</b> ✅ Активен\n"
         f"<b>Отслеживаемых пар:</b> {len(tracked_symbols)}\n"
-        f"<b>Дневной лимит:</b> {DAILY_VOLUME_LIMIT:,} USDT\n"
-        f"<b>Таймфрейм:</b> 1 минута\n"
-        f"<b>Условие алерта:</b> < {MIN_PREV_VOLUME:,} → > {MIN_CURRENT_VOLUME:,} USDT\n\n"
-        f"<i>Используй /debug для отладки</i>",
+        f"<b>Фильтр по 1D объёму:</b> < {DAILY_VOLUME_LIMIT:,} USDT\n"
+        f"<b>Таймфрейм для алертов:</b> 1 минута\n"
+        f"<b>Условие алерта:</b> Объём < {MIN_PREV_VOLUME:,} → > {MIN_CURRENT_VOLUME:,} USDT\n\n"
+        f"<i>Команды: /stats, /list, /refresh</i>",
         parse_mode="HTML"
     )
 
 
-async def debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отладочная информация"""
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Статистика"""
     if update.effective_user.id != MY_USER_ID:
         return
     
-    debug_info = (
-        f"<b>🔧 Отладочная информация</b>\n\n"
+    await update.message.reply_text(
+        f"<b>📈 Статистика</b>\n\n"
         f"<b>Отслеживаемых пар:</b> {len(tracked_symbols)}\n"
-        f"<b>Примеры пар:</b>\n"
+        f"<b>Алертов сегодня:</b> {len(sent_alerts)}\n"
+        f"<b>Лимит 1D объёма:</b> {DAILY_VOLUME_LIMIT:,} USDT\n"
+        f"<b>Условие 1M алерта:</b> <{MIN_PREV_VOLUME:,} → >{MIN_CURRENT_VOLUME:,} USDT\n"
+        f"<b>Время:</b> {datetime.now().strftime('%H:%M:%S')}",
+        parse_mode="HTML"
     )
+
+
+async def list_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список отслеживаемых пар"""
+    if update.effective_user.id != MY_USER_ID:
+        return
     
-    # Показываем первые 5 пар
-    sample = list(tracked_symbols)[:5]
-    for i, symbol in enumerate(sample):
-        debug_info += f"{i+1}. {symbol}\n"
+    if not tracked_symbols:
+        await update.message.reply_text("ℹ️ Нет отслеживаемых пар")
+        return
     
-    debug_info += f"\n<b>Активных алертов:</b> {len(sent_alerts)}\n"
-    debug_info += f"<b>Время запуска:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+    symbols_list = sorted(list(tracked_symbols))
     
-    await update.message.reply_text(debug_info, parse_mode="HTML")
+    # Разбиваем на части по 30 символов
+    chunks = [symbols_list[i:i+30] for i in range(0, len(symbols_list), 30)]
+    
+    for i, chunk in enumerate(chunks):
+        await update.message.reply_text(
+            f"<b>📋 Отслеживаемые пары ({i+1}/{len(chunks)})</b>\n\n" +
+            "\n".join(f"• {symbol}" for symbol in chunk),
+            parse_mode="HTML"
+        )
 
 
 async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -381,12 +426,14 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     await update.message.reply_text("🔄 Обновляю список пар...")
-    success = await load_low_volume_symbols()
+    
+    success = await load_and_filter_symbols()
     
     if success:
         await update.message.reply_text(
             f"✅ Обновлено!\n"
-            f"Отслеживается: {len(tracked_symbols)} пар",
+            f"Отслеживается: {len(tracked_symbols)} пар\n"
+            f"Условие: 1D объём < {DAILY_VOLUME_LIMIT:,} USDT",
             parse_mode="HTML"
         )
     else:
@@ -398,7 +445,7 @@ async def refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def lifespan(app: FastAPI):
     global scanner_task, application, bot_instance
     
-    logger.info("=== Запуск MEXC Volume Scanner ===")
+    logger.info("=== Запуск MEXC 1D Volume Scanner ===")
     
     # Создаем экземпляр бота
     bot_instance = Bot(token=TELEGRAM_TOKEN)
@@ -406,14 +453,15 @@ async def lifespan(app: FastAPI):
     # Инициализируем Telegram приложение
     application = Application.builder().token(TELEGRAM_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("debug", debug))
+    application.add_handler(CommandHandler("stats", stats))
+    application.add_handler(CommandHandler("list", list_symbols))
     application.add_handler(CommandHandler("refresh", refresh))
     
-    # Загружаем символы
-    await load_low_volume_symbols()
+    # Загружаем и фильтруем символы
+    await load_and_filter_symbols()
     
     # Запускаем сканер
-    scanner_task = asyncio.create_task(scan_all_low_volume_pairs())
+    scanner_task = asyncio.create_task(volume_spike_scanner())
     logger.info("Сканер запущен в фоне")
     
     # Запускаем Telegram бота
@@ -454,25 +502,17 @@ app = FastAPI(lifespan=lifespan)
 @app.get("/")
 async def root():
     return {
-        "service": "MEXC Volume Scanner",
+        "service": "MEXC 1D Volume Scanner",
         "status": "active",
         "timestamp": datetime.now().isoformat(),
         "tracked_pairs": len(tracked_symbols),
+        "daily_volume_limit": DAILY_VOLUME_LIMIT,
         "alerts_today": len(sent_alerts)
     }
 
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
-
-@app.get("/status")
-async def status():
-    sample = list(tracked_symbols)[:10] if tracked_symbols else []
-    return {
-        "tracked_pairs": len(tracked_symbols),
-        "sample_symbols": sample,
-        "daily_limit": DAILY_VOLUME_LIMIT
-    }
 
 
 # ====================== ЗАПУСК ======================
