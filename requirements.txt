@@ -2,4 +2,5 @@ python-telegram-bot>=20.0
 aiohttp
 python-dotenv
 fastapi
+asyncpg==0.29.0
 uvicorn
