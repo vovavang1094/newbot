@@ -15,7 +15,7 @@ import uvicorn
 from datetime import datetime
 
 # Импортируем базу данных
-from database import db
+from database_simple import db
 
 # ====================== НАСТРОЙКИ ======================
 load_dotenv()
@@ -1005,6 +1005,7 @@ if __name__ == "__main__":
         port=port,
         reload=False
     )
+
 
 
 
